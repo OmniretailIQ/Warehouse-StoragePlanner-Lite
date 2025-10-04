@@ -5,7 +5,12 @@ from io import BytesIO
 
 st.set_page_config(page_title="Warehouse Planner Lite (Sets)", layout="wide")
 
-# ====================== Sidebar controls ======================
+# -------------------- Session State Boot --------------------
+for k in ["results_ready", "colour_final", "size_final", "pf_assign", "bulk_assign", "drive_df", "consolidated_df"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
+# -------------------- Sidebar controls --------------------
 st.sidebar.title("Planner Controls")
 
 cap_total = st.sidebar.number_input("Warehouse capacity (pieces)", value=680000, step=10000)
@@ -19,13 +24,13 @@ bulk_density_threshold = st.sidebar.slider("Bulk density threshold (≤ x is Bul
 cov_min = st.sidebar.slider("Overall days cover min", 5, 15, 10)
 cov_max = st.sidebar.slider("Overall days cover max", 8, 20, 12)
 
-st.sidebar.caption("Density: 1–3 = PF-friendly; 4–10 = Bulk; >10 = CrossDock. Strangers always CrossDock.")
+st.sidebar.caption("Density rules: 1–3 = PF-friendly; 4–10 = Bulk; >10 = CrossDock. Strangers always CrossDock.")
 
-# Racking defaults per your spec
+# Racking defaults
 pf_levels_max = st.sidebar.number_input("Pick-Face max level (1=bottom; default 3)", value=3, min_value=1, max_value=10)
 slot_capacity_default = st.sidebar.number_input("Capacity per slot (pieces)", value=60, step=5)
 
-# ABC/RRS→PF bands (defaults)
+# PF Min/Max (days) by ABC×RRS (editable)
 st.sidebar.subheader("PF Min/Max (days) by ABC×RRS")
 def_val = {
     ("A","Runner"): (2,4),
@@ -48,14 +53,19 @@ for key, (dmin, dmax) in def_val.items():
         mx = st.number_input(f"PF Max {a}/{r}", value=dmax, key=f"pfmax_{a}_{r}")
     pf_policy[key] = (mn, mx)
 
-# ====================== Page header ======================
+# Hybrid allocation toggle + optional overrides
+hybrid_mode = st.sidebar.checkbox("Hybrid allocation (auto choose Colour vs Size per article)", value=True)
+st.sidebar.caption("Hybrid mode avoids double counting by selecting one axis per article/family.")
+override_file = st.sidebar.file_uploader("Optional: Axis Overrides CSV (columns: division,department,brand,article,force_axis)", type=["csv"])
+
+# -------------------- Page header --------------------
 st.title("Warehouse Planner Lite — Set-level (Colour/Size)")
 st.markdown("""
 Upload **Q1 cumulative sales** and **ABC/RRS SKU lists**.  
-Optional: upload **Bin Master** for Pick-Face/Bulk racking assignment (Zone/Floor → Row → Bay → Level/Tier).
+Optional: upload **Bin Master** for Pick-Face/Bulk assignment (Zone/Floor → Row → Bay → Level/Tier).
 """)
 
-# ====================== Uploaders ======================
+# -------------------- Uploaders --------------------
 sales_file = st.file_uploader("Q1 Cumulative Sales (Excel/CSV)", type=["xlsx","csv"])
 a_file = st.file_uploader("A Class SKUs (Excel/CSV)", type=["xlsx","csv"])
 b_file = st.file_uploader("B Class SKUs (Excel/CSV)", type=["xlsx","csv"])
@@ -68,8 +78,9 @@ stranger_file = st.file_uploader("Stranger SKUs (Excel/CSV)", type=["xlsx","csv"
 bin_file = st.file_uploader("Bin Master (Excel or CSV)", type=["xlsx","csv"])
 
 run_btn = st.button("Run Planner")
+just_clicked_run = run_btn
 
-# ====================== Helpers ======================
+# -------------------- Helpers --------------------
 def read_xlsx_or_csv(uploaded):
     if uploaded is None:
         return None
@@ -91,7 +102,6 @@ def norm_size(x):
 
 @st.cache_data(show_spinner=False)
 def build_sets(sales_df, abc_map_df, rrs_map_df):
-    # normalize / guard missing columns
     keep = ["invarticle_code","article","department","division","section","sze","colour","brand","total_qty","Count of total_qty"]
     for c in keep:
         if c not in sales_df.columns: sales_df[c] = np.nan
@@ -114,7 +124,7 @@ def build_sets(sales_df, abc_map_df, rrs_map_df):
         Distinct_Sizes=("size_norm","nunique"),
         ABC_Prio_Max=("ABC_Prio","max"),
     ).reset_index()
-    c_agg = c_agg[c_agg["Total_Qty_Q1"] > 0].copy()
+    c_agg = c_agg[c_agg["Total_Qty_Q1"]>0].copy()
     c_agg["Style_Density_Proxy"] = (c_agg["SKU_Count"]/c_agg["Distinct_Sizes"].replace(0,1)).round(1)
     c_agg["ABC_Class_Rolled"] = c_agg["ABC_Prio_Max"].map({3:"A",2:"B",1:"C",0:np.nan})
 
@@ -135,7 +145,7 @@ def build_sets(sales_df, abc_map_df, rrs_map_df):
         Distinct_Colours=("colour","nunique"),
         ABC_Prio_Max=("ABC_Prio","max"),
     ).reset_index()
-    s_agg = s_agg[s_agg["Total_Qty_Q1"] > 0].copy()
+    s_agg = s_agg[s_agg["Total_Qty_Q1"]>0].copy()
     s_agg["Style_Density_Proxy"] = (s_agg["SKU_Count"]/s_agg["Distinct_Colours"].replace(0,1)).round(1)
     s_agg["ABC_Class_Rolled"] = s_agg["ABC_Prio_Max"].map({3:"A",2:"B",1:"C",0:np.nan})
 
@@ -166,26 +176,21 @@ def zoning(abc, rrs, dens, pf_thr, bulk_thr):
 
 def compute_minmax(set_df, set_type, festival_map, pf_policy_map, cov_min_days, cov_max_days, cap_total_pcs):
     df = set_df.copy()
-    # daily demand + festival uplift
     df["D_day"] = (df["Total_Qty_Q1"] / 13.0) / 7.0
     df["Uplift"] = df["RRS_Class_Rolled"].map(festival_map).fillna(1.0)
     df["D_day_uplift"] = df["D_day"] * df["Uplift"]
 
-    # PF bands
     def pf_days(row):
         key = (row.get("ABC_Class_Rolled"), row.get("RRS_Class_Rolled"))
         return pf_policy_map.get(key, (0,0))
     pf_vals = df.apply(pf_days, axis=1, result_type="expand")
     df["PF_Min_days"], df["PF_Max_days"] = pf_vals[0], pf_vals[1]
 
-    # Zoning by density
     df["Zoning"] = [zoning(a,r,d, pf_density_threshold, bulk_density_threshold)
                     for a,r,d in zip(df["ABC_Class_Rolled"], df["RRS_Class_Rolled"], df["Style_Density_Proxy"])]
 
-    # PF only for PF zones
     df.loc[df["Zoning"]!="PickFace+Bulk", ["PF_Min_days","PF_Max_days"]] = (0,0)
 
-    # qty calc
     df["PF_Min_units_raw"] = df["D_day_uplift"] * df["PF_Min_days"]
     df["PF_Max_units_raw"] = df["D_day_uplift"] * df["PF_Max_days"]
 
@@ -198,7 +203,7 @@ def compute_minmax(set_df, set_type, festival_map, pf_policy_map, cov_min_days, 
     df["Bulk_Min_units"] = (df["D_day_uplift"] * (0.6*df["BulkTarget_days"])).round().astype(int)
     df["Bulk_Max_units"] = (df["D_day_uplift"] * (1.0*df["BulkTarget_days"])).round().astype(int)
 
-    # Capacity governor
+    # Default "finals" (governor may adjust later on driving pool)
     def tier(a, r):
         if a=="A" and r=="Runner": return 1
         if a=="A" and r=="Repeater": return 2
@@ -207,52 +212,51 @@ def compute_minmax(set_df, set_type, festival_map, pf_policy_map, cov_min_days, 
         return 5
     df["Tier"] = [tier(a,r) for a,r in zip(df["ABC_Class_Rolled"], df["RRS_Class_Rolled"])]
     df["Bulk_Final"] = df["Bulk_Max_units"].copy()
-
-    projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
-    surplus = max(projected - cap_total_pcs, 0)
-
-    if surplus > 0:
-        # reduce Tier >=3 first
-        for t in [3,4,5]:
-            if surplus <= 0: break
-            mask = df["Tier"]==t
-            flex = (df.loc[mask,"Bulk_Final"] - df.loc[mask,"Bulk_Min_units"]).clip(lower=0)
-            flex_sum = int(flex.sum())
-            if flex_sum>0:
-                share = surplus * (flex / flex_sum)
-                df.loc[mask,"Bulk_Final"] = (df.loc[mask,"Bulk_Final"] - share.clip(upper=flex)).round().astype(int)
-                projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
-                surplus = max(projected - cap_total_pcs, 0)
-
-        # then Tier 2, then Tier 1
-        for t in [2,1]:
-            if surplus <= 0: break
-            mask = df["Tier"]==t
-            flex = (df.loc[mask,"Bulk_Final"] - df.loc[mask,"Bulk_Min_units"]).clip(lower=0)
-            flex_sum = int(flex.sum())
-            if flex_sum>0:
-                share = surplus * (flex / flex_sum)
-                df.loc[mask,"Bulk_Final"] = (df.loc[mask,"Bulk_Final"] - share.clip(upper=flex)).round().astype(int)
-                projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
-                surplus = max(projected - cap_total_pcs, 0)
-
     df["Final_Total"] = df["PF_Max_units"] + df["Bulk_Final"]
     df["Final_DaysCover"] = np.where(df["D_day_uplift"]>0, df["Final_Total"]/df["D_day_uplift"], 0.0)
     df["Set_Type"] = set_type
     return df
 
-# --- Bin Master normalization per your structure ---
+# --- Axis overrides & hybrid selection helpers ---
+def load_axis_overrides(uploaded_csv):
+    if uploaded_csv is None:
+        return pd.DataFrame(columns=["division","department","brand","article","force_axis"])
+    odf = pd.read_csv(uploaded_csv)
+    odf.columns = [c.strip().lower() for c in odf.columns]
+    need = ["division","department","brand","article","force_axis"]
+    for c in need:
+        if c not in odf.columns: odf[c] = np.nan
+    odf["force_axis"] = odf["force_axis"].astype(str).str.strip().str.title()  # "ColourSet"/"SizeSet"
+    return odf[need]
+
+SIZE_DEPT_HINTS = {"Leggings","Bottoms","Denim","Chinos","Trousers","Innerwear","Briefs","Bras"}
+COLOUR_DEPT_HINTS = {"Kurtis","Dresses","Tops","Tshirts","Shirts","Tees","Sweatshirts"}
+
+def choose_axis_for_article(row, size_span, colour_span, size_density, colour_density, pf_thr, bulk_thr):
+    dept = str(row.get("department","")).strip().title()
+    if dept in SIZE_DEPT_HINTS: 
+        return "SizeSet"
+    if dept in COLOUR_DEPT_HINTS: 
+        return "ColourSet"
+    # data-driven
+    if (size_span >= 4) and (colour_span <= 3):
+        return "SizeSet"
+    if (colour_span >= 4) and (size_span <= 3):
+        return "ColourSet"
+    # lower density = more coherent
+    if size_density < colour_density:
+        return "SizeSet"
+    if colour_density < size_density:
+        return "ColourSet"
+    # PF-friendliness tie-break
+    if (size_density <= pf_thr) and (colour_density > pf_thr):
+        return "SizeSet"
+    if (colour_density <= pf_thr) and (size_density > pf_thr):
+        return "ColourSet"
+    return "ColourSet"
+
+# --- Bin Master normalization ---
 def build_bin_master(df):
-    """
-    Expected input columns (case-insensitive):
-      floor, row, bay, level, slot, loc_code_hr, loc_code_scan
-    Mapping:
-      zone := floor
-      tier := F00->1, F01->2, ...
-      bin_code := loc_code_scan (fallback to loc_code_hr)
-      bin_type := PF if level <= pf_levels_max else BULK
-      capacity_units := slot_capacity_default (each row ≈ one slot)
-    """
     d = df.copy()
     d.columns = [c.strip().lower() for c in d.columns]
 
@@ -263,7 +267,6 @@ def build_bin_master(df):
     row = pd.to_numeric(get("row"), errors="coerce")
     bay = pd.to_numeric(get("bay"), errors="coerce")
     level = pd.to_numeric(get("level"), errors="coerce")
-    slot = get("slot")  # reserved if needed later
     scan = get("loc_code_scan").astype(str)
     hr = get("loc_code_hr").astype(str)
 
@@ -274,7 +277,7 @@ def build_bin_master(df):
         if s.startswith("F"):
             rest = s[1:]
             if rest.isdigit():
-                return int(rest) + 1  # F00 => 1 (ground), F01 => 2, ...
+                return int(rest) + 1  # F00 => 1
         return np.nan
 
     tier = floor.apply(floor_to_tier)
@@ -312,14 +315,11 @@ def assign_bins(sets_df, bins_df, pf_or_bulk="PF"):
         bins_avail = bins_df[bins_df["bin_type"]=="BULK"].copy()
 
     cand = cand[cand["Need"]>0].sort_values(["prio","Style_Density_Proxy","D_day_uplift"], ascending=[True,True,False]).reset_index(drop=True)
-
-    # FIX: reset index after sort and use positional indexing
     bins_avail = bins_avail.sort_values(["zone","row","bay","level","bin_code"]).copy().reset_index(drop=True)
     bins_avail["available"] = bins_avail["capacity_units"].copy()
 
     assigns = []
     bin_idx = 0
-    # cache column index for fast .iat updates
     avail_col = bins_avail.columns.get_loc("available")
 
     for _, row in cand.iterrows():
@@ -362,13 +362,96 @@ def assign_bins(sets_df, bins_df, pf_or_bulk="PF"):
 
     return pd.DataFrame(assigns)
 
-# ====================== Run ======================
-if run_btn:
+def apply_capacity_governor(drive_df, cap_total_pcs):
+    df = drive_df.copy()
+    projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
+    surplus = max(projected - cap_total_pcs, 0)
+    if surplus <= 0:
+        df["Final_Total"] = df["PF_Max_units"] + df["Bulk_Final"]
+        df["Final_DaysCover"] = np.where(df["D_day_uplift"]>0, df["Final_Total"]/df["D_day_uplift"], 0.0)
+        return df
+    # reduce tiers 5→1
+    for t in [5,4,3,2,1]:
+        if surplus <= 0: break
+        mask = df["Tier"]==t
+        flex = (df.loc[mask,"Bulk_Final"] - df.loc[mask,"Bulk_Min_units"]).clip(lower=0)
+        flex_sum = int(flex.sum())
+        if flex_sum>0:
+            share = surplus * (flex / flex_sum)
+            df.loc[mask,"Bulk_Final"] = (df.loc[mask,"Bulk_Final"] - share.clip(upper=flex)).round().astype(int)
+            projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
+            surplus = max(projected - cap_total_pcs, 0)
+    df["Final_Total"] = df["PF_Max_units"] + df["Bulk_Final"]
+    df["Final_DaysCover"] = np.where(df["D_day_uplift"]>0, df["Final_Total"]/df["D_day_uplift"], 0.0)
+    return df
+
+def build_consolidated(drive_df, pf_assign_df, bulk_assign_df):
+    base_cols = [
+        "Set_ID","Set_Type","division","department","brand","article",
+        "colour","size_norm",
+        "ABC_Class_Rolled","RRS_Class_Rolled","Style_Density_Proxy","Zoning",
+        "D_day","D_day_uplift",
+        "PF_Min_days","PF_Max_days","PF_Min_units","PF_Max_units",
+        "Bulk_Min_units","Bulk_Max_units","Bulk_Final",
+        "Final_Total","Final_DaysCover","Tier"
+    ]
+    base = drive_df.copy()
+    for c in base_cols:
+        if c not in base.columns:
+            base[c] = np.nan
+    base = base[base_cols].copy()
+    base["Set_Key"] = np.where(base["Set_Type"].eq("ColourSet"), base["colour"], base["size_norm"])
+    base.rename(columns={"colour":"Colour", "size_norm":"Size"}, inplace=True)
+
+    pf = pf_assign_df.copy()
+    if not pf.empty:
+        pf["PF_Bin"] = pf["Zone"].astype(str)+"|R"+pf["Row"].astype(str)+"|B"+pf["Bay"].astype(str)+"|L"+pf["Level"].astype(str)
+        pf_g = pf.groupby("Set_ID", as_index=False).agg(
+            PF_Assigned_Qty=("Assigned_Qty","sum"),
+            PF_Bins=("PF_Bin", lambda s: "; ".join(map(str, s)))
+        )
+    else:
+        pf_g = base[["Set_ID"]].drop_duplicates().assign(PF_Assigned_Qty=0, PF_Bins="")
+
+    bk = bulk_assign_df.copy()
+    if not bk.empty:
+        bk["Bulk_Bin"] = bk["Zone"].astype(str)+"|R"+bk["Row"].astype(str)+"|B"+bk["Bay"].astype(str)+"|L"+bk["Level"].astype(str)
+        bk_g = bk.groupby("Set_ID", as_index=False).agg(
+            Bulk_Assigned_Qty=("Assigned_Qty","sum"),
+            Bulk_Bins=("Bulk_Bin", lambda s: "; ".join(map(str, s)))
+        )
+    else:
+        bk_g = base[["Set_ID"]].drop_duplicates().assign(Bulk_Assigned_Qty=0, Bulk_Bins="")
+
+    cons = base.merge(pf_g, on="Set_ID", how="left").merge(bk_g, on="Set_ID", how="left") \
+               .fillna({"PF_Assigned_Qty":0, "Bulk_Assigned_Qty":0, "PF_Bins":"", "Bulk_Bins":""})
+    cons["PF_Assigned_Qty"] = cons["PF_Assigned_Qty"].astype(int)
+    cons["Bulk_Assigned_Qty"] = cons["Bulk_Assigned_Qty"].astype(int)
+    cons["Total_Assigned_Qty"] = cons["PF_Assigned_Qty"] + cons["Bulk_Assigned_Qty"]
+    cons["Set_Label"] = cons["Set_Type"].str.replace("Set","",regex=False) + ":" + cons["Set_Key"].astype(str)
+
+    ordered = [
+        "Set_ID","Set_Type","Set_Label","division","department","brand","article","Colour","Size",
+        "ABC_Class_Rolled","RRS_Class_Rolled","Style_Density_Proxy","Zoning","Tier",
+        "D_day","D_day_uplift",
+        "PF_Min_days","PF_Max_days","PF_Min_units","PF_Max_units",
+        "Bulk_Min_units","Bulk_Max_units","Bulk_Final",
+        "Final_Total","Final_DaysCover",
+        "PF_Assigned_Qty","Bulk_Assigned_Qty","Total_Assigned_Qty",
+        "PF_Bins","Bulk_Bins"
+    ]
+    for c in ordered:
+        if c not in cons.columns:
+            cons[c] = np.nan
+    return cons[ordered]
+
+# -------------------- Run / Display (Session-State) --------------------
+if just_clicked_run:
     sales_df = read_sales(sales_file)
     if sales_df is None:
         st.error("Please upload the Q1 Cumulative Sales file."); st.stop()
 
-    # ABC maps (auto-detect SKU column)
+    # ABC / RRS mapping
     def build_map(uploaded, label_col, label_val):
         if uploaded is None: return None
         t = read_xlsx_or_csv(uploaded)
@@ -379,8 +462,7 @@ if run_btn:
             if c in lc:
                 cand = t.columns[lc.index(c)]
                 break
-        if cand is None:
-            cand = t.columns[0]
+        if cand is None: cand = t.columns[0]
         out = t[[cand]].rename(columns={cand:"invarticle_code"})
         out[label_col] = label_val
         return out.drop_duplicates()
@@ -408,7 +490,7 @@ if run_btn:
         if raw is not None and not raw.empty:
             bins_df = build_bin_master(raw)
 
-    with st.spinner("Building sets and computing zoning & min–max..."):
+    with st.spinner("Building sets, computing hybrid axis, zoning & min–max..."):
         colour_sets, size_sets = build_sets(sales_df, abc_map_df, rrs_map_df)
 
         # Zoning (ABC×RRS + density thresholds)
@@ -417,18 +499,106 @@ if run_btn:
         size_sets["Zoning"] = [zoning(a,r,d, pf_density_threshold, bulk_density_threshold)
                                for a,r,d in zip(size_sets["ABC_Class_Rolled"], size_sets["RRS_Class_Rolled"], size_sets["Style_Density_Proxy"])]
 
-        # Festival map & PF policy
         festival_map = {"Runner": festival_runner_repeater, "Repeater": festival_runner_repeater, "Stranger": festival_stranger}
         pf_policy_map = pf_policy
 
         colour_final = compute_minmax(colour_sets.assign(Set_Type="ColourSet"),
                                       "ColourSet", festival_map, pf_policy_map, cov_min, cov_max, cap_total)
-        size_final = compute_minmax(size_sets.assign(Set_Type="SizeSet"),
-                                    "SizeSet", festival_map, pf_policy_map, cov_min, cov_max, cap_total)
+        size_final   = compute_minmax(size_sets.assign(Set_Type="SizeSet"),
+                                      "SizeSet", festival_map, pf_policy_map, cov_min, cov_max, cap_total)
+
+        # Hybrid allocation decision (per article)
+        drive_df = None
+        if hybrid_mode:
+            art_keys = ["division","department","brand","article"]
+            c_metrics = colour_final.groupby(art_keys, dropna=False).agg(
+                colour_span=("Colour","nunique"),
+                colour_sku=("SKU_Count","sum"),
+                colour_qty=("Total_Qty_Q1","sum"),
+                colour_density=("Style_Density_Proxy","mean")
+            ).reset_index()
+            s_metrics = size_final.groupby(art_keys, dropna=False).agg(
+                size_span=("size_norm","nunique"),
+                size_sku=("SKU_Count","sum"),
+                size_qty=("Total_Qty_Q1","sum"),
+                size_density=("Style_Density_Proxy","mean")
+            ).reset_index()
+            axis_df = pd.merge(c_metrics, s_metrics, on=art_keys, how="outer")
+            for col in ["colour_span","size_span","colour_density","size_density"]:
+                axis_df[col] = pd.to_numeric(axis_df[col], errors="coerce").fillna(0)
+
+            odf = load_axis_overrides(override_file)
+            if not odf.empty:
+                axis_df = axis_df.merge(odf, on=art_keys, how="left")
+            else:
+                axis_df["force_axis"] = np.nan
+
+            decisions = []
+            for _, r in axis_df.iterrows():
+                if pd.notna(r.get("force_axis")) and r["force_axis"] in ("ColourSet","SizeSet"):
+                    decisions.append(r["force_axis"])
+                else:
+                    decisions.append(
+                        choose_axis_for_article(
+                            r,
+                            int(r.get("size_span",0)), int(r.get("colour_span",0)),
+                            float(r.get("size_density",999)), float(r.get("colour_density",999)),
+                            pf_density_threshold, bulk_density_threshold
+                        )
+                    )
+            axis_df["chosen_axis"] = decisions
+
+            # Attach chosen axis & filter
+            colour_with_axis = colour_final.merge(axis_df[art_keys+["chosen_axis"]], on=art_keys, how="left")
+            size_with_axis   = size_final.merge(axis_df[art_keys+["chosen_axis"]], on=art_keys, how="left")
+
+            drive_colour = colour_with_axis[colour_with_axis["chosen_axis"].eq("ColourSet")].copy()
+            drive_size   = size_with_axis[size_with_axis["chosen_axis"].eq("SizeSet")].copy()
+            drive_df = pd.concat([drive_colour, drive_size], ignore_index=True)
+
+            # Apply capacity governor on driving union
+            drive_df = apply_capacity_governor(drive_df, cap_total)
+        else:
+            # Non-hybrid simple mode: choose one axis in sidebar (default ColourSets)
+            alloc_axis = st.sidebar.radio("Allocation axis (non-hybrid)", options=["ColourSets","SizeSets"], index=0)
+            if alloc_axis == "ColourSets":
+                drive_df = apply_capacity_governor(colour_final.copy(), cap_total)
+            else:
+                drive_df = apply_capacity_governor(size_final.copy(), cap_total)
+
+    # Racking assignment (only driving pool)
+    pf_assign = pd.DataFrame()
+    bulk_assign = pd.DataFrame()
+    if bins_df is not None:
+        with st.spinner("Assigning sets to PF/Bulk bins..."):
+            pf_assign = assign_bins(drive_df, bins_df, pf_or_bulk="PF")
+            bulk_assign = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
+
+    # Consolidated table
+    consolidated_df = build_consolidated(drive_df, pf_assign, bulk_assign)
+
+    # Save to session
+    st.session_state["colour_final"] = colour_final
+    st.session_state["size_final"] = size_final
+    st.session_state["pf_assign"] = pf_assign
+    st.session_state["bulk_assign"] = bulk_assign
+    st.session_state["drive_df"] = drive_df
+    st.session_state["consolidated_df"] = consolidated_df
+    st.session_state["results_ready"] = True
+
+# -------------------- Display from session --------------------
+if st.session_state["results_ready"]:
+    colour_final = st.session_state["colour_final"]
+    size_final = st.session_state["size_final"]
+    pf_assign = st.session_state["pf_assign"]
+    bulk_assign = st.session_state["bulk_assign"]
+    drive_df = st.session_state["drive_df"]
+    consolidated_df = st.session_state["consolidated_df"]
 
     st.success("Planner run complete. Explore below and download outputs.")
+    st.caption("Hybrid allocation (if enabled) selects Colour or Size per article; racking & capacity uses the chosen axis only.")
 
-    # ====================== Display (preview) ======================
+    # ColourSets
     st.subheader("Colour Sets — Zoning & Min–Max (preview)")
     st.dataframe(colour_final.head(500))
     st.caption(f"Colour Sets total rows: {len(colour_final):,}")
@@ -440,6 +610,7 @@ if run_btn:
         use_container_width=True
     )
 
+    # SizeSets
     st.subheader("Size Sets — Zoning & Min–Max (preview)")
     st.dataframe(size_final.head(500))
     st.caption(f"Size Sets total rows: {len(size_final):,}")
@@ -451,52 +622,51 @@ if run_btn:
         use_container_width=True
     )
 
-    # ====================== Racking Assignment (if Bin Master uploaded) ======================
-    pf_assign = pd.DataFrame()
-    bulk_assign = pd.DataFrame()
-    if bins_df is not None:
-        st.subheader("Racking Assignment (using Bin Master)")
-        pool = pd.concat([colour_final, size_final], ignore_index=True)
-        pf_assign = assign_bins(pool, bins_df, pf_or_bulk="PF")
-        bulk_assign = assign_bins(pool, bins_df, pf_or_bulk="BULK")
+    # Racking assignment previews
+    if pf_assign is not None and not pf_assign.empty:
+        st.subheader("Pick-Face Assignments (preview)")
+        st.dataframe(pf_assign.head(500))
+        st.caption(f"PF assignments rows: {len(pf_assign):,}")
+        st.download_button(
+            "Download PF Assignments (CSV, full)",
+            data=pf_assign.to_csv(index=False).encode("utf-8"),
+            file_name="PF_Assignments_full.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+    if bulk_assign is not None and not bulk_assign.empty:
+        st.subheader("Bulk Assignments (preview)")
+        st.dataframe(bulk_assign.head(500))
+        st.caption(f"Bulk assignments rows: {len(bulk_assign):,}")
+        st.download_button(
+            "Download Bulk Assignments (CSV, full)",
+            data=bulk_assign.to_csv(index=False).encode("utf-8"),
+            file_name="Bulk_Assignments_full.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
 
-        if not pf_assign.empty:
-            st.markdown("**Pick-Face Assignments (preview)**")
-            st.dataframe(pf_assign.head(500))
-            st.caption(f"PF assignments rows: {len(pf_assign):,}")
-            st.download_button(
-                "Download PF Assignments (CSV, full)",
-                data=pf_assign.to_csv(index=False).encode("utf-8"),
-                file_name="PF_Assignments_full.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        else:
-            st.info("No PF assignments (either no PF bins or no PF-eligible sets).")
+    # Consolidated Plan
+    st.subheader("Consolidated Storage Plan (Min–Max + PF/Bulk bins) — preview")
+    st.dataframe(consolidated_df.head(500))
+    st.caption(f"Consolidated rows: {len(consolidated_df):,}")
+    st.download_button(
+        "Download Consolidated Storage Plan (CSV, full)",
+        data=consolidated_df.to_csv(index=False).encode("utf-8"),
+        file_name="Consolidated_Storage_Plan.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
 
-        if not bulk_assign.empty:
-            st.markdown("**Bulk Assignments (preview)**")
-            st.dataframe(bulk_assign.head(500))
-            st.caption(f"Bulk assignments rows: {len(bulk_assign):,}")
-            st.download_button(
-                "Download Bulk Assignments (CSV, full)",
-                data=bulk_assign.to_csv(index=False).encode("utf-8"),
-                file_name="Bulk_Assignments_full.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
-        else:
-            st.info("No Bulk assignments (either no Bulk bins or no Bulk need).")
-
-    # ====================== Excel Download (always full) ======================
-    def to_excel(col_df, size_df, pf_df=None, bulk_df=None):
+    # Excel export (full)
+    def to_excel(col_df, size_df, pf_df=None, bulk_df=None, consolidated=None):
         output = BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             pd.DataFrame({"Notes":[
                 "Warehouse Planner Lite Output",
-                "Tabs: ColourSets, SizeSets, PF_Assignments, Bulk_Assignments (if Bin Master uploaded).",
+                "Tabs: ColourSets, SizeSets, PF_Assignments, Bulk_Assignments, Consolidated.",
                 "Zone=floor; Tier=F00->1; PF levels <= user setting (default 1–3); capacity per slot configurable.",
-                "Contains ABC/RRS roll-ups, Style Density, Zoning, festival-aware Min–Max, capacity-governed totals."
+                "Hybrid mode selects Colour or Size per article; only the chosen axis feeds capacity & racking."
             ]}).to_excel(writer, sheet_name="README", index=False)
             col_df.to_excel(writer, sheet_name="ColourSets", index=False)
             size_df.to_excel(writer, sheet_name="SizeSets", index=False)
@@ -504,9 +674,11 @@ if run_btn:
                 pf_df.to_excel(writer, sheet_name="PF_Assignments", index=False)
             if bulk_df is not None and not bulk_df.empty:
                 bulk_df.to_excel(writer, sheet_name="Bulk_Assignments", index=False)
+            if consolidated is not None and not consolidated.empty:
+                consolidated.to_excel(writer, sheet_name="Consolidated", index=False)
         return output.getvalue()
 
-    xls_bytes = to_excel(colour_final, size_final, pf_assign, bulk_assign)
+    xls_bytes = to_excel(colour_final, size_final, pf_assign, bulk_assign, consolidated_df)
     st.download_button(
         "Download Planner Output (Excel, full)",
         data=xls_bytes,
@@ -515,7 +687,14 @@ if run_btn:
         use_container_width=True
     )
 
+    # Optional: Reset
+    if st.button("Clear Results"):
+        for k in ["results_ready","colour_final","size_final","pf_assign","bulk_assign","drive_df","consolidated_df"]:
+            st.session_state[k] = None
+        st.experimental_rerun()
+
 else:
     st.info("Upload files (and optional Bin Master) then click **Run Planner**.")
+
 
 
