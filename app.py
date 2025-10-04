@@ -513,7 +513,9 @@ def pf_remaining_capacity_bins(bins_df, pf_assign_df):
         used = (pf_assign_df.groupby("Bin_Code", as_index=False)["Assigned_Qty"]
                           .sum().rename(columns={"Assigned_Qty":"Used"}))
 
-    out = pf_bins.merge(used, left_on="bin_code", right_on="bin_code", how="left")
+    out = pf_bins.merge(used, left_on="bin_code", right_on="Bin_Code", how="left")
+    if "Bin_Code" in out.columns:
+        out = out.drop(columns=["Bin_Code"])
     out["Used"] = pd.to_numeric(out["Used"], errors="coerce").fillna(0).astype(int)
     out["available"] = (out["capacity_units"] - out["Used"]).clip(lower=0)
     # Sort in a stable walking order
