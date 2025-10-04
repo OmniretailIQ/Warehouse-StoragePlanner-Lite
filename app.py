@@ -14,18 +14,31 @@ for k in ["results_ready", "colour_final", "size_final", "pf_assign", "bulk_assi
 # -------------------- Sidebar controls --------------------
 st.sidebar.title("Planner Controls")
 
+# Capacity & demand controls
 cap_total = st.sidebar.number_input("Warehouse capacity (pieces)", value=680000, step=10000)
+baseline_override = st.sidebar.number_input(
+    "Override baseline daily demand (pcs/day, optional)",
+    min_value=0, value=0, step=1000,
+    help="Leave 0 to auto-compute from the sales file; set e.g. 60000 to force the planner baseline."
+)
 
 festival_runner_repeater = st.sidebar.number_input("Festival uplift: Runners/Repeaters ×", value=2.0, step=0.25, format="%.2f")
 festival_stranger = st.sidebar.number_input("Festival uplift: Strangers ×", value=1.25, step=0.05, format="%.2f")
 
-pf_density_threshold = st.sidebar.slider("Pick-Face density threshold (≤ x is PF-friendly)", 1, 10, 3)
+# Density thresholds (PF eligibility & staging)
+pf_density_threshold = st.sidebar.slider("Pick-Face density threshold (≤ x is PF-friendly)", 1, 10, 5)
 bulk_density_threshold = st.sidebar.slider("Bulk density threshold (≤ x is Bulk; > goes CrossDock)", 4, 20, 10)
+st.sidebar.caption("Density rules: 1–3 = PF-friendly; 4–10 = Bulk; >10 = CrossDock. Strangers always CrossDock.")
 
+# Roll-up majority threshold
+majority_threshold = st.sidebar.slider(
+    "Majority threshold for set roll-up (%)", 50, 80, 50,
+    help="Minimum share by distinct SKU count to call a clear majority for ABC/RRS at set level."
+) / 100.0
+
+# Cover windows (governor will still enforce capacity)
 cov_min = st.sidebar.slider("Overall days cover min", 5, 15, 10)
 cov_max = st.sidebar.slider("Overall days cover max", 8, 20, 12)
-
-st.sidebar.caption("Density rules: 1–3 = PF-friendly; 4–10 = Bulk; >10 = CrossDock. Strangers always CrossDock.")
 
 # Racking defaults
 pf_levels_max = st.sidebar.number_input("Pick-Face max level (1=bottom; default 3)", value=3, min_value=1, max_value=10)
@@ -54,7 +67,7 @@ for key, (dmin, dmax) in def_val.items():
         mx = st.number_input(f"PF Max {a}/{r}", value=dmax, key=f"pfmax_{a}_{r}")
     pf_policy[key] = (mn, mx)
 
-# Hybrid allocation toggle + optional overrides
+# Hybrid allocation (choose Colour vs Size per article)
 hybrid_mode = st.sidebar.checkbox("Hybrid allocation (auto choose Colour vs Size per article)", value=True)
 st.sidebar.caption("Hybrid mode avoids double counting by selecting one axis per article/family.")
 override_file = st.sidebar.file_uploader("Optional: Axis Overrides CSV (division,department,brand,article,force_axis)", type=["csv"])
@@ -102,10 +115,74 @@ def read_sales(uploaded):
 def norm_size(x):
     if pd.isna(x): return np.nan
     s = str(x).strip().upper().replace(" ", "")
-    return s.replace("FREESIZE","FREE").replace("FREE SIZE","FREE").replace("XXXL","3XL").replace("2XL","XXL")
+    return (s.replace("FREESIZE","FREE")
+             .replace("FREE SIZE","FREE")
+             .replace("XXXL","3XL")
+             .replace("2XL","XXL"))
 
-@st.cache_data(show_spinner=False)
-def build_sets(sales_df, abc_map_df, rrs_map_df):
+def rollup_rrs_majority_by_sku(sku_frame, keys, threshold=0.5):
+    """
+    Majority by distinct SKU count within the set.
+    If no class >= threshold, fallback preference: Repeater > Runner > Stranger > Unknown (tie-break by qty).
+    """
+    df = sku_frame.copy()
+    df["RRS_Class"] = df["RRS_Class"].fillna("Unknown")
+    uni = df.drop_duplicates(subset=keys + ["invarticle_code","RRS_Class"])
+    cnt = uni.groupby(keys + ["RRS_Class"], dropna=False)["invarticle_code"].nunique().rename("sku_cnt").reset_index()
+    tot = cnt.groupby(keys, dropna=False)["sku_cnt"].sum().rename("sku_tot")
+    cnt = cnt.merge(tot, on=keys, how="left")
+    cnt["share"] = cnt["sku_cnt"] / cnt["sku_tot"].replace(0, np.nan)
+    win = cnt.sort_values(keys + ["share","sku_cnt"], ascending=[True]*len(keys) + [False, False]) \
+             .drop_duplicates(subset=keys, keep="first")[keys + ["RRS_Class","share"]].copy()
+    need_fb = win["share"].fillna(0) < threshold
+    if need_fb.any():
+        qty = df.groupby(keys + ["RRS_Class"], dropna=False)["total_qty"].sum().rename("qty").reset_index()
+        pref = {"Repeater":3, "Runner":2, "Stranger":1, "Unknown":0}
+        qty["pref"] = qty["RRS_Class"].map(pref).fillna(-1)
+        fb = qty.sort_values(keys + ["pref","qty"], ascending=[True]*len(keys) + [False, False]) \
+                .drop_duplicates(subset=keys, keep="first")[keys + ["RRS_Class"]]
+        win = win.merge(fb, on=keys, how="left", suffixes=("","_FB"))
+        win.loc[need_fb, "RRS_Class"] = win.loc[need_fb, "RRS_Class_FB"]
+        win = win.drop(columns=["RRS_Class_FB","share"], errors="ignore")
+    else:
+        win = win.drop(columns=["share"], errors="ignore")
+    return win.rename(columns={"RRS_Class":"RRS_Class_Rolled"})
+
+def rollup_abc_majority_by_sku(sku_frame, keys, threshold=0.5):
+    """
+    Majority by distinct SKU count (A/B/C). If no class >= threshold,
+    fallback to departmental Pareto on set sales (A to cum<=80%, B to 95%, else C).
+    """
+    df = sku_frame.copy()
+    df["ABC_Class"] = df["ABC_Class"].fillna(np.nan)
+    uni = df.drop_duplicates(subset=keys + ["invarticle_code","ABC_Class"])
+    cnt = uni.groupby(keys + ["ABC_Class"], dropna=False)["invarticle_code"].nunique().rename("sku_cnt").reset_index()
+    tot = cnt.groupby(keys, dropna=False)["sku_cnt"].sum().rename("sku_tot")
+    cnt = cnt.merge(tot, on=keys, how="left")
+    cnt["share"] = cnt["sku_cnt"] / cnt["sku_tot"].replace(0, np.nan)
+    win = cnt.sort_values(keys + ["share","sku_cnt"], ascending=[True]*len(keys) + [False, False]) \
+             .drop_duplicates(subset=keys, keep="first")[keys + ["ABC_Class","share"]].copy()
+    win.rename(columns={"ABC_Class":"ABC_Class_Rolled"}, inplace=True)
+
+    need_fb = win["share"].fillna(0) < threshold
+    if need_fb.any():
+        sales = df.groupby(keys, dropna=False)["total_qty"].sum().rename("set_qty").reset_index()
+        dept_keys = ["department"] if "department" in df.columns else ["division"]
+        tmp = sales.copy()
+        tmp = tmp.sort_values(dept_keys + ["set_qty"], ascending=[True]*len(dept_keys) + [False])
+        tmp["tot_dept"] = tmp.groupby(dept_keys, dropna=False)["set_qty"].transform("sum")
+        tmp["cum_share"] = tmp.groupby(dept_keys, dropna=False)["set_qty"].cumsum() / tmp["tot_dept"].replace(0, np.nan)
+        tmp["ABC_fb"] = np.where(tmp["cum_share"] <= 0.80, "A",
+                          np.where(tmp["cum_share"] <= 0.95, "B", "C"))
+        fb = tmp[keys + ["ABC_fb"]]
+        win = win.merge(fb, on=keys, how="left")
+        win.loc[need_fb, "ABC_Class_Rolled"] = win.loc[need_fb, "ABC_fb"]
+        win = win.drop(columns=["ABC_fb","share"], errors="ignore")
+    else:
+        win = win.drop(columns=["share"], errors="ignore")
+    return win
+
+def build_sets(sales_df, abc_map_df, rrs_map_df, majority_threshold):
     keep = ["invarticle_code","article","department","division","section","sze","colour","brand","total_qty","Count of total_qty"]
     for c in keep:
         if c not in sales_df.columns: sales_df[c] = np.nan
@@ -117,50 +194,47 @@ def build_sets(sales_df, abc_map_df, rrs_map_df):
     sales["size_norm"] = sales["sze"].apply(norm_size)
 
     sku = sales.merge(abc_map_df, on="invarticle_code", how="left").merge(rrs_map_df, on="invarticle_code", how="left")
-    sku["ABC_Prio"] = sku["ABC_Class"].map({"A":3,"B":2,"C":1}).fillna(0).astype(int)
 
-    # Colour Sets
+    # COLOUR SETS aggregation
     ck = ["division","department","brand","article","colour"]
     c_agg = sku.groupby(ck, dropna=False).agg(
         Total_Qty_Q1=("total_qty","sum"),
         SKU_Count=("invarticle_code","nunique"),
         Txn_Count=("Count of total_qty","sum"),
         Distinct_Sizes=("size_norm","nunique"),
-        ABC_Prio_Max=("ABC_Prio","max"),
     ).reset_index()
     c_agg = c_agg[c_agg["Total_Qty_Q1"]>0].copy()
     c_agg["Style_Density_Proxy"] = (c_agg["SKU_Count"]/c_agg["Distinct_Sizes"].replace(0,1)).round(1)
-    c_agg["ABC_Class_Rolled"] = c_agg["ABC_Prio_Max"].map({3:"A",2:"B",1:"C",0:np.nan})
 
-    c_rrs = sku.loc[:, ck+["RRS_Class","total_qty"]].copy()
-    c_rrs["RRS_Class"] = c_rrs["RRS_Class"].fillna("Unknown")
-    c_rrs = c_rrs.groupby(ck+["RRS_Class"], as_index=False)["total_qty"].sum().sort_values(
-        ck+["total_qty"], ascending=[True,True,True,True,True,False])
-    c_rrs_top = c_rrs.drop_duplicates(subset=ck, keep="first").rename(columns={"RRS_Class":"RRS_Class_Rolled"})
-    colour_sets = c_agg.merge(c_rrs_top[ck+["RRS_Class_Rolled"]], on=ck, how="left")
-    colour_sets["Set_ID"] = ("COL-"+pd.util.hash_pandas_object(colour_sets[ck].fillna(""), index=False).astype(str).str[-10:])
-
-    # Size Sets
+    # SIZE SETS aggregation
     sk = ["division","department","brand","article","size_norm"]
     s_agg = sku.groupby(sk, dropna=False).agg(
         Total_Qty_Q1=("total_qty","sum"),
         SKU_Count=("invarticle_code","nunique"),
         Txn_Count=("Count of total_qty","sum"),
         Distinct_Colours=("colour","nunique"),
-        ABC_Prio_Max=("ABC_Prio","max"),
     ).reset_index()
     s_agg = s_agg[s_agg["Total_Qty_Q1"]>0].copy()
     s_agg["Style_Density_Proxy"] = (s_agg["SKU_Count"]/s_agg["Distinct_Colours"].replace(0,1)).round(1)
-    s_agg["ABC_Class_Rolled"] = s_agg["ABC_Prio_Max"].map({3:"A",2:"B",1:"C",0:np.nan})
 
-    s_rrs = sku.loc[:, sk+["RRS_Class","total_qty"]].copy()
-    s_rrs["RRS_Class"] = s_rrs["RRS_Class"].fillna("Unknown")
-    s_rrs = s_rrs.groupby(sk+["RRS_Class"], as_index=False)["total_qty"].sum().sort_values(
-        sk+["total_qty"], ascending=[True,True,True,True,True,False])
-    s_rrs_top = s_rrs.drop_duplicates(subset=sk, keep="first").rename(columns={"RRS_Class":"RRS_Class_Rolled"})
-    size_sets = s_agg.merge(s_rrs_top[sk+["RRS_Class_Rolled"]], on=sk, how="left")
-    size_sets["Set_ID"] = ("SIZ-"+pd.util.hash_pandas_object(size_sets[sk].fillna(""), index=False).astype(str).str[-10:])
+    # RRS roll-up: majority by SKU
+    c_rrs = rollup_rrs_majority_by_sku(sku[ck + ["invarticle_code","RRS_Class","total_qty","Count of total_qty"]],
+                                       keys=ck, threshold=majority_threshold)
+    s_rrs = rollup_rrs_majority_by_sku(sku[sk + ["invarticle_code","RRS_Class","total_qty","Count of total_qty"]],
+                                       keys=sk, threshold=majority_threshold)
 
+    # ABC roll-up: majority by SKU (fallback dept Pareto)
+    c_abc = rollup_abc_majority_by_sku(sku[ck + ["invarticle_code","ABC_Class","total_qty"]],
+                                       keys=ck, threshold=majority_threshold)
+    s_abc = rollup_abc_majority_by_sku(sku[sk + ["invarticle_code","ABC_Class","total_qty"]],
+                                       keys=sk, threshold=majority_threshold)
+
+    colour_sets = c_agg.merge(c_rrs, on=ck, how="left").merge(c_abc, on=ck, how="left")
+    size_sets   = s_agg.merge(s_rrs, on=sk, how="left").merge(s_abc, on=sk, how="left")
+
+    # IDs
+    colour_sets["Set_ID"] = ("COL-"+pd.util.hash_pandas_object(colour_sets[ck].fillna(""), index=False).astype(str).str[-10:])
+    size_sets["Set_ID"]   = ("SIZ-"+pd.util.hash_pandas_object(size_sets[sk].fillna(""), index=False).astype(str).str[-10:])
     return colour_sets, size_sets
 
 def zoning(abc, rrs, dens, pf_thr, bulk_thr):
@@ -180,6 +254,7 @@ def zoning(abc, rrs, dens, pf_thr, bulk_thr):
 
 def compute_minmax(set_df, set_type, festival_map, pf_policy_map, cov_min_days, cov_max_days, cap_total_pcs):
     df = set_df.copy()
+    # Daily demand from Q1 → 13 weeks → 7 days/week (we will normalize to baseline later)
     df["D_day"] = (df["Total_Qty_Q1"] / 13.0) / 7.0
     df["Uplift"] = df["RRS_Class_Rolled"].map(festival_map).fillna(1.0)
     df["D_day_uplift"] = df["D_day"] * df["Uplift"]
@@ -190,8 +265,10 @@ def compute_minmax(set_df, set_type, festival_map, pf_policy_map, cov_min_days, 
     pf_vals = df.apply(pf_days, axis=1, result_type="expand")
     df["PF_Min_days"], df["PF_Max_days"] = pf_vals[0], pf_vals[1]
 
-    df["Zoning"] = [zoning(a,r,d, pf_density_threshold, bulk_density_threshold)
-                    for a,r,d in zip(df["ABC_Class_Rolled"], df["RRS_Class_Rolled"], df["Style_Density_Proxy"])]
+    # Zoning already determined before calling this in main, but keep safe
+    if "Zoning" not in df.columns:
+        df["Zoning"] = [zoning(a,r,d, pf_density_threshold, bulk_density_threshold)
+                        for a,r,d in zip(df["ABC_Class_Rolled"], df["RRS_Class_Rolled"], df["Style_Density_Proxy"])]
 
     df.loc[df["Zoning"]!="PickFace+Bulk", ["PF_Min_days","PF_Max_days"]] = (0,0)
 
@@ -207,7 +284,6 @@ def compute_minmax(set_df, set_type, festival_map, pf_policy_map, cov_min_days, 
     df["Bulk_Min_units"] = (df["D_day_uplift"] * (0.6*df["BulkTarget_days"])).round().astype(int)
     df["Bulk_Max_units"] = (df["D_day_uplift"] * (1.0*df["BulkTarget_days"])).round().astype(int)
 
-    # Default finals; governor will apply on the driving pool
     def tier(a, r):
         if a=="A" and r=="Runner": return 1
         if a=="A" and r=="Repeater": return 2
@@ -221,7 +297,7 @@ def compute_minmax(set_df, set_type, festival_map, pf_policy_map, cov_min_days, 
     df["Set_Type"] = set_type
     return df
 
-# --- Axis overrides & hybrid selection helpers ---
+# Axis overrides & hybrid selection helpers
 def load_axis_overrides(uploaded_csv):
     if uploaded_csv is None:
         return pd.DataFrame(columns=["division","department","brand","article","force_axis"])
@@ -256,7 +332,7 @@ def choose_axis_for_article(row, size_span, colour_span, size_density, colour_de
         return "ColourSet"
     return "ColourSet"
 
-# --- Bin Master normalization ---
+# Bin Master normalization
 def build_bin_master(df):
     d = df.copy()
     d.columns = [c.strip().lower() for c in d.columns]
@@ -278,7 +354,7 @@ def build_bin_master(df):
         if s.startswith("F"):
             rest = s[1:]
             if rest.isdigit():
-                return int(rest) + 1  # F00 => 1
+                return int(rest) + 1  # F00 => 1 (ground)
         return np.nan
 
     tier = floor.apply(floor_to_tier)
@@ -295,15 +371,12 @@ def build_bin_master(df):
         "bin_type": bin_type,
         "capacity_units": capacity_units,
     })
-
-    # Cleanup: drop unusable rows and enforce numeric
     bins = bins.dropna(subset=["level", "bin_code"])
     bins = bins[bins["bin_code"].astype(str).str.strip() != ""]
     bins["row"] = pd.to_numeric(bins["row"], errors="coerce")
     bins["bay"] = pd.to_numeric(bins["bay"], errors="coerce")
     bins["level"] = pd.to_numeric(bins["level"], errors="coerce")
     bins = bins.dropna(subset=["row","bay","level"]).reset_index(drop=True)
-
     bins["sort_key"] = (bins["zone"].astype(str)+"|"+bins["row"].astype(str)+"|"+
                         bins["bay"].astype(str)+"|"+bins["level"].astype(str)+"|"+bins["bin_code"].astype(str))
     return bins
@@ -394,7 +467,6 @@ def apply_capacity_governor(drive_df, cap_total_pcs, pf_cap_pcs=None):
         pf_sum = int(df["PF_Max_units"].sum())
         pf_surplus = max(pf_sum - int(pf_cap_pcs), 0)
         if pf_surplus > 0:
-            # Reduce PF down to PF_Min by tier 5→1
             for t in [5,4,3,2,1]:
                 if pf_surplus <= 0: break
                 mask = (df["Tier"]==t) & (df["PF_Max_units"] > df["PF_Min_units"])
@@ -406,7 +478,6 @@ def apply_capacity_governor(drive_df, cap_total_pcs, pf_cap_pcs=None):
                     pf_sum = int(df["PF_Max_units"].sum())
                     pf_surplus = max(pf_sum - int(pf_cap_pcs), 0)
 
-            # If still over PF cap, allow dipping below PF_Min (last resort)
             if pf_surplus > 0:
                 for t in [5,4,3,2,1]:
                     if pf_surplus <= 0: break
@@ -423,7 +494,6 @@ def apply_capacity_governor(drive_df, cap_total_pcs, pf_cap_pcs=None):
     projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
     surplus = max(projected - int(cap_total_pcs), 0)
     if surplus > 0:
-        # First trim Bulk down to Bulk_Min, Tier 5→1
         for t in [5,4,3,2,1]:
             if surplus <= 0: break
             mask = df["Tier"]==t
@@ -436,7 +506,6 @@ def apply_capacity_governor(drive_df, cap_total_pcs, pf_cap_pcs=None):
                 surplus = max(projected - int(cap_total_pcs), 0)
 
     if surplus > 0:
-        # Still over? Trim PF further (below PF_Min), Tier 5→1 (last resort)
         for t in [5,4,3,2,1]:
             if surplus <= 0: break
             mask = (df["Tier"]==t) & (df["PF_Max_units"] > 0)
@@ -448,7 +517,6 @@ def apply_capacity_governor(drive_df, cap_total_pcs, pf_cap_pcs=None):
                 projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
                 surplus = max(projected - int(cap_total_pcs), 0)
 
-    # Recompute finals
     df["Final_Total"] = df["PF_Max_units"] + df["Bulk_Final"]
     df["Final_DaysCover"] = np.where(df["D_day_uplift"]>0, df["Final_Total"]/df["D_day_uplift"], 0.0)
     return df
@@ -526,21 +594,17 @@ def build_kanban_triggers(drive_df, pf_assign_df, bulk_assign_df):
     df["Set_Label"] = df["Set_Type"].str.replace("Set","",regex=False) + ":" + df["Set_Key"].astype(str)
     df.rename(columns={"colour":"Colour","size_norm":"Size"}, inplace=True)
 
-    # PF bins compact list for each set (may be empty)
     pf_bins = pd.DataFrame(columns=["Set_ID","PF_Bins"])
     if pf_assign_df is not None and not pf_assign_df.empty:
         t = pf_assign_df.copy()
         t["PF_Bin"] = t["Zone"].astype(str)+"|R"+t["Row"].astype(str)+"|B"+t["Bay"].astype(str)+"|L"+t["Level"].astype(str)
         pf_bins = t.groupby("Set_ID", as_index=False).agg(PF_Bins=("PF_Bin", lambda s: "; ".join(map(str, s))))
-
-    # Bulk bins compact list
     bk_bins = pd.DataFrame(columns=["Set_ID","Bulk_Bins"])
     if bulk_assign_df is not None and not bulk_assign_df.empty:
         t = bulk_assign_df.copy()
         t["Bulk_Bin"] = t["Zone"].astype(str)+"|R"+t["Row"].astype(str)+"|B"+t["Bay"].astype(str)+"|L"+t["Level"].astype(str)
         bk_bins = t.groupby("Set_ID", as_index=False).agg(Bulk_Bins=("Bulk_Bin", lambda s: "; ".join(map(str, s))))
 
-    # PF Kanban rows (PF-eligible + has a min > 0)
     pf_df = df[(df["Zoning"].eq("PickFace+Bulk")) & (df["PF_Min_units"]>0)].copy()
     pf_df["Area"] = "PF"
     pf_df["Min_Qty"] = pf_df["PF_Min_units"].astype(int)
@@ -549,16 +613,14 @@ def build_kanban_triggers(drive_df, pf_assign_df, bulk_assign_df):
     pf_df["Bins"] = pf_df["PF_Bins"].fillna("")
     pf_df.drop(columns=["PF_Bins"], inplace=True)
 
-    # Bulk Kanban rows (Bulk or PF+Bulk with a bulk min > 0)
     bk_df = df[df["Zoning"].isin(["PickFace+Bulk","Bulk"]) & (df["Bulk_Min_units"]>0)].copy()
     bk_df["Area"] = "BULK"
     bk_df["Min_Qty"] = bk_df["Bulk_Min_units"].astype(int)
-    bk_df["Target_Qty"] = bk_df["Bulk_Final"].astype(int)  # governed target
+    bk_df["Target_Qty"] = bk_df["Bulk_Final"].astype(int)
     bk_df = bk_df.merge(bk_bins, on="Set_ID", how="left")
     bk_df["Bins"] = bk_df["Bulk_Bins"].fillna("")
     bk_df.drop(columns=["Bulk_Bins"], inplace=True)
 
-    # Combine and compute implied days at min/target
     out = pd.concat([pf_df, bk_df], ignore_index=True)
     out["Implied_Min_Days"] = np.where(out["D_day_uplift"]>0, out["Min_Qty"]/out["D_day_uplift"], 0.0)
     out["Implied_Target_Days"] = np.where(out["D_day_uplift"]>0, out["Target_Qty"]/out["D_day_uplift"], 0.0)
@@ -574,16 +636,12 @@ def compute_uplifted_daily_baseline(sales_df, rrs_map_df):
     """Compute baseline uplifted daily demand directly from the raw sales file (prevents overcount)."""
     s = sales_df.copy()
     qty = pd.to_numeric(s.get("total_qty", 0), errors="coerce").fillna(0.0)
-
-    # roll to unique SKU
     if "invarticle_code" not in s.columns:
-        # if the column name differs in your file, this prevents a crash
         s.columns = [str(c) for c in s.columns]
     sku = s[["invarticle_code"]].copy()
     sku["total_qty"] = qty
     sku = sku.groupby("invarticle_code", as_index=False)["total_qty"].sum()
 
-    # join RRS to get per-SKU uplift (Unknown -> 1.0)
     rrs = (rrs_map_df.drop_duplicates(subset=["invarticle_code"]).copy()
            if rrs_map_df is not None and not rrs_map_df.empty else
            pd.DataFrame(columns=["invarticle_code","RRS_Class"]))
@@ -591,7 +649,7 @@ def compute_uplifted_daily_baseline(sales_df, rrs_map_df):
     sku = sku.merge(rrs, on="invarticle_code", how="left")
     sku["uplift"] = sku["RRS_Class"].map(uplift_map).fillna(1.0)
 
-    # Q1 ≈ 91 days; baseline *with* uplift
+    # Use 91 days for Q1 baseline
     daily = (sku["total_qty"] / 91.0) * sku["uplift"]
     return float(daily.sum())
 
@@ -640,10 +698,10 @@ if just_clicked_run:
         if raw is not None and not raw.empty:
             bins_df = build_bin_master(raw)
 
-    with st.spinner("Building sets, computing hybrid axis, zoning & min–max..."):
-        colour_sets, size_sets = build_sets(sales_df, abc_map_df, rrs_map_df)
+    with st.spinner("Building sets (majority roll-ups), zoning & min–max..."):
+        colour_sets, size_sets = build_sets(sales_df, abc_map_df, rrs_map_df, majority_threshold)
 
-        # Zoning (ABC×RRS + density thresholds)
+        # Zoning using majority-rolled classes
         colour_sets["Zoning"] = [zoning(a,r,d, pf_density_threshold, bulk_density_threshold)
                                  for a,r,d in zip(colour_sets["ABC_Class_Rolled"], colour_sets["RRS_Class_Rolled"], colour_sets["Style_Density_Proxy"])]
         size_sets["Zoning"] = [zoning(a,r,d, pf_density_threshold, bulk_density_threshold)
@@ -697,68 +755,75 @@ if just_clicked_run:
                     )
             axis_df["chosen_axis"] = decisions
 
-            # Attach chosen axis & filter to non-overlapping driving union
             colour_with_axis = colour_final.merge(axis_df[art_keys+["chosen_axis"]], on=art_keys, how="left")
             size_with_axis   = size_final.merge(axis_df[art_keys+["chosen_axis"]], on=art_keys, how="left")
             drive_colour = colour_with_axis[colour_with_axis["chosen_axis"].eq("ColourSet")].copy()
             drive_size   = size_with_axis[size_with_axis["chosen_axis"].eq("SizeSet")].copy()
             drive_df = pd.concat([drive_colour, drive_size], ignore_index=True)
         else:
-            # Non-hybrid simple mode: choose one axis in sidebar (default ColourSets)
             alloc_axis = st.sidebar.radio("Allocation axis (non-hybrid)", options=["ColourSets","SizeSets"], index=0)
             drive_df = colour_final.copy() if alloc_axis=="ColourSets" else size_final.copy()
 
-        # Compute optional PF capacity from Bin Master (for governor)
-        pf_cap = None
-        if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
-            pf_cap = int(bins_df.loc[bins_df["bin_type"]=="PF","capacity_units"].sum())
+    # Debug expander (pre-normalization)
+    with st.expander("Debug: classification & zoning distribution (pre-normalization)", expanded=False):
+        st.write("ABC rolled counts:", drive_df["ABC_Class_Rolled"].value_counts(dropna=False).to_dict())
+        st.write("RRS rolled counts:", drive_df["RRS_Class_Rolled"].value_counts(dropna=False).to_dict())
+        st.write("Zoning counts:", drive_df["Zoning"].value_counts(dropna=False).to_dict())
+        st.write("PF-eligible (PickFace+Bulk):", int((drive_df["Zoning"]=="PickFace+Bulk").sum()))
+        st.write("Density quantiles:", drive_df["Style_Density_Proxy"].quantile([0.25,0.5,0.75,0.9,0.95]).to_dict())
 
-        # Apply governor on the driving union with PF cap awareness
-        # ---- Normalize demand so sum(D_day_uplift) matches the file baseline (prevents over-count) ----
+    # PF capacity from Bin Master (for governor)
+    pf_cap = None
+    if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
+        pf_cap = int(bins_df.loc[bins_df["bin_type"]=="PF","capacity_units"].sum())
+
+    # ---- Normalize demand so sum(D_day_uplift) matches the baseline (prevents over-count) ----
+    if baseline_override and baseline_override > 0:
+        baseline_daily_uplift = float(baseline_override)
+    else:
         baseline_daily_uplift = compute_uplifted_daily_baseline(sales_df, rrs_map_df)
-        sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
-        scale = 1.0
-        if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
-            scale = baseline_daily_uplift / sum_drive_daily_uplift
 
-        if scale != 1.0:
-            # Scale demand and all unit-based targets proportionally
-            for col in ["D_day", "D_day_uplift",
-                        "PF_Min_units_raw", "PF_Max_units_raw",
-                        "PF_Min_units", "PF_Max_units",
-                        "Bulk_Min_units", "Bulk_Max_units",
-                        "Bulk_Final", "Final_Total"]:
-                if col in drive_df.columns:
-                    drive_df[col] = (drive_df[col].astype(float) * scale)
+    sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
+    scale = 1.0
+    if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
+        scale = baseline_daily_uplift / sum_drive_daily_uplift
 
-        # Recompute cover days on scaled demand
+    if scale != 1.0:
+        for col in ["D_day", "D_day_uplift",
+                    "PF_Min_units_raw", "PF_Max_units_raw",
+                    "PF_Min_units", "PF_Max_units",
+                    "Bulk_Min_units", "Bulk_Max_units",
+                    "Bulk_Final", "Final_Total"]:
+            if col in drive_df.columns:
+                drive_df[col] = (drive_df[col].astype(float) * scale)
+
         drive_df["Final_DaysCover"] = np.where(
             drive_df["D_day_uplift"]>0,
             drive_df["Final_Total"]/drive_df["D_day_uplift"],
             0.0
         )
 
-        # ---- Now apply the capacity governors (PF cap, then Total cap) ----
-        drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
+    # ---- Apply capacity governors (PF cap, then Total cap) ----
+    drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
 
-        # -------- Governed Summary (store in session) --------
-        daily_demand_total = float(drive_df["D_day_uplift"].sum())
-        pf_need = int(drive_df["PF_Max_units"].sum())
-        bulk_need = int(drive_df["Bulk_Final"].sum())
-        total_need = pf_need + bulk_need
-        gov_cover_days = (total_need / daily_demand_total) if daily_demand_total > 0 else 0.0
-        st.session_state["gov_summary"] = {
-            "pf_cap": int(pf_cap) if pf_cap is not None else None,
-            "pf_need": pf_need,
-            "pf_cap_util": (pf_need / pf_cap) if pf_cap else None,
-            "total_cap": int(cap_total),
-            "total_need": int(total_need),
-            "bulk_need": int(bulk_need),
-            "daily_demand": daily_demand_total,
-            "cover_days": float(gov_cover_days),
-        }
+    # -------- Governed Summary (store in session) --------
+    daily_demand_total = float(drive_df["D_day_uplift"].sum())
+    pf_need = int(drive_df["PF_Max_units"].sum())
+    bulk_need = int(drive_df["Bulk_Final"].sum())
+    total_need = pf_need + bulk_need
+    gov_cover_days = (total_need / daily_demand_total) if daily_demand_total > 0 else 0.0
+    st.session_state["gov_summary"] = {
+        "pf_cap": int(pf_cap) if pf_cap is not None else None,
+        "pf_need": pf_need,
+        "pf_cap_util": (pf_need / pf_cap) if pf_cap else None,
+        "total_cap": int(cap_total),
+        "total_need": int(total_need),
+        "bulk_need": int(bulk_need),
+        "daily_demand": daily_demand_total,
+        "cover_days": float(gov_cover_days),
+    }
 
-    # Racking assignment (only driving pool) + diagnostics
+    # Racking assignment (governed) + diagnostics
     pf_assign = pd.DataFrame()
     bulk_assign = pd.DataFrame()
     pf_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
@@ -768,7 +833,7 @@ if just_clicked_run:
             pf_assign, pf_diag = assign_bins(drive_df, bins_df, pf_or_bulk="PF")
             bulk_assign, bulk_diag = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
 
-    # Reason codes (why bins may be blank)
+    # Reason codes
     drive_flags = drive_df.copy()
     drive_flags["PF_Eligible"] = drive_flags["Zoning"].eq("PickFace+Bulk")
     drive_flags["PF_Need"] = drive_flags["PF_Max_units"].fillna(0).astype(int)
@@ -950,7 +1015,6 @@ if st.session_state["results_ready"]:
     def to_excel(col_df, size_df, pf_df=None, bulk_df=None, consolidated=None, kanban=None):
         output = BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            # README + governed summary snapshot
             notes = [
                 "Warehouse Planner Lite Output",
                 "Tabs: ColourSets, SizeSets, PF_Assignments, Bulk_Assignments, Consolidated, (optional) Kanban.",
@@ -981,16 +1045,15 @@ if st.session_state["results_ready"]:
         "Download Planner Output (Excel, full)",
         data=xls_bytes,
         file_name="WarehousePlannerLite_Output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheet.sheet",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True
     )
 
-    # Optional: Reset
     if st.button("Clear Results"):
         for k in ["results_ready","colour_final","size_final","pf_assign","bulk_assign","drive_df",
                   "consolidated_df","pf_diag","bulk_diag","gov_summary"]:
             st.session_state[k] = None
-        st.rerun()
-
+        st.experimental_rerun()
 else:
     st.info("Upload files (and optional Bin Master) then click **Run Planner**.")
+
