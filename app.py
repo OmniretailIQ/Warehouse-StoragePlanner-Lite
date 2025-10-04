@@ -1113,7 +1113,7 @@ if isinstance(_cons_df, pd.DataFrame) and not _cons_df.empty:
     with c4:
         st.metric("% Cross-Dock", f"{pct_crossdock:.1f}%")
 
-    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment."
+    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
 
 
 # ---- PF overflow absorption metrics ----
@@ -1202,7 +1202,7 @@ if isinstance(_cons_df, pd.DataFrame) and not _cons_df.empty:
     with c4:
         st.metric("% Cross-Dock", f"{pct_crossdock:.1f}%")
 
-    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment."
+    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
 
 
 # ---- PF overflow absorption metrics ----
