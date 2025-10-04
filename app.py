@@ -715,9 +715,9 @@ if just_clicked_run:
 
     # Apply governor on the driving union with PF cap awareness
     # ---- Normalize demand so sum(D_day_uplift) matches the file baseline (prevents over-count) ----
-   baseline_daily_uplift = compute_uplifted_daily_baseline(sales_df, rrs_map_df)
-   sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
-   scale = 1.0
+    baseline_daily_uplift = compute_uplifted_daily_baseline(sales_df, rrs_map_df)
+    sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
+    scale = 1.0
    if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
     scale = baseline_daily_uplift / sum_drive_daily_uplift
 
