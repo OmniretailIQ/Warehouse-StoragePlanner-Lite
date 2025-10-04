@@ -719,7 +719,7 @@ if just_clicked_run:
     sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
     scale = 1.0
     if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
-    scale = baseline_daily_uplift / sum_drive_daily_uplift
+      scale = baseline_daily_uplift / sum_drive_daily_uplift
 
     if scale != 1.0:
     # Scale demand and all unit-based targets proportionally
