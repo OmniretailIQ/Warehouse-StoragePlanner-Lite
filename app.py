@@ -1085,24 +1085,38 @@ if 'allow_pf_overflow' in globals() and allow_pf_overflow and _bins_df_obj is no
     consolidated_df = build_consolidated(drive_df, pf_assign, bulk_assign)
 
 
+
+
+
 # -------- Cross-Dock Summary --------
-st.subheader("Cross-Dock Summary")
-total_need_units = int(consolidated_df["Final_Total"].sum())
-total_assigned_units = int(consolidated_df["Total_Assigned_Qty"].sum())
-total_crossdock_units = int(consolidated_df["CrossDock_Qty"].sum())
-pct_crossdock = (100.0 * total_crossdock_units / total_need_units) if total_need_units > 0 else 0.0
+if isinstance(consolidated_df, pd.DataFrame) and not consolidated_df.empty:
+    st.subheader("Cross-Dock Summary")
+    total_need_units = int(consolidated_df["Final_Total"].sum())
+    total_assigned_units = int(consolidated_df["Total_Assigned_Qty"].sum())
+    total_crossdock_units = int(consolidated_df["CrossDock_Qty"].sum())
+    pct_crossdock = (100.0 * total_crossdock_units / total_need_units) if total_need_units > 0 else 0.0
 
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.metric("Total need (pcs)", f"{total_need_units:,}")
-with c2:
-    st.metric("Assigned (PF+Bulk)", f"{total_assigned_units:,}")
-with c3:
-    st.metric("Cross-Dock (pcs)", f"{total_crossdock_units:,}")
-with c4:
-    st.metric("% Cross-Dock", f"{pct_crossdock:.1f}%")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Total need (pcs)", f"{total_need_units:,}")
+    with c2:
+        st.metric("Assigned (PF+Bulk)", f"{total_assigned_units:,}")
+    with c3:
+        st.metric("Cross-Dock (pcs)", f"{total_crossdock_units:,}")
+    with c4:
+        st.metric("% Cross-Dock", f"{pct_crossdock:.1f}%")
 
-st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
+    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
+
+# Reason-code flags (PF/Bulk eligibility & need snapshots)
+drive_flags = drive_df.copy()
+drive_flags["PF_Eligible"] = drive_flags["Zoning"].eq("PickFace+Bulk")
+drive_flags["PF_Need"] = drive_flags["PF_Max_units"].fillna(0).astype(int)
+drive_flags["Bulk_Need"] = drive_flags["Bulk_Final"].fillna(0).astype(int)
+pf_flags = drive_flags[["Set_ID","PF_Eligible","PF_Need"]].drop_duplicates()
+bk_flags = drive_flags[["Set_ID","Bulk_Need"]].drop_duplicates()
+
+
 
 consolidated_df = consolidated_df.merge(pf_flags, on="Set_ID", how="left").merge(bk_flags, on="Set_ID", how="left")
 consolidated_df["PF_Reason"] = consolidated_df.apply(reason_pf, axis=1)
@@ -1132,6 +1146,28 @@ if st.session_state["results_ready"]:
     gs = st.session_state.get("gov_summary", {}) or {}
 
     st.success("Planner run complete. Explore below and download outputs.")
+
+# -------- Cross-Dock Summary (from session) --------
+if isinstance(consolidated_df, pd.DataFrame) and not consolidated_df.empty:
+    st.subheader("Cross-Dock Summary")
+    total_need_units = int(consolidated_df["Final_Total"].sum())
+    total_assigned_units = int(consolidated_df["Total_Assigned_Qty"].sum())
+    total_crossdock_units = int(consolidated_df["CrossDock_Qty"].sum())
+    pct_crossdock = (100.0 * total_crossdock_units / total_need_units) if total_need_units > 0 else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Total need (pcs)", f"{total_need_units:,}")
+    with c2:
+        st.metric("Assigned (PF+Bulk)", f"{total_assigned_units:,}")
+    with c3:
+        st.metric("Cross-Dock (pcs)", f"{total_crossdock_units:,}")
+    with c4:
+        st.metric("% Cross-Dock", f"{pct_crossdock:.1f}%")
+
+    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
+
+
     st.caption("Hybrid allocation (if enabled) selects Colour or Size per article; racking & capacity use the chosen axis only.")
 
     # -------- Governed Summary panel --------
