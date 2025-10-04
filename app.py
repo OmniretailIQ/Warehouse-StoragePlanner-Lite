@@ -759,11 +759,11 @@ st.session_state["gov_summary"] = {
     }
 
     # Racking assignment (only driving pool) + diagnostics
-    pf_assign = pd.DataFrame()
-    bulk_assign = pd.DataFrame()
-    pf_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
-    bulk_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
-    if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
+pf_assign = pd.DataFrame()
+bulk_assign = pd.DataFrame()
+pf_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
+bulk_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
+if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
         with st.spinner("Assigning sets to PF/Bulk bins..."):
             pf_assign, pf_diag = assign_bins(drive_df, bins_df, pf_or_bulk="PF")
             bulk_assign, bulk_diag = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
