@@ -739,7 +739,7 @@ if just_clicked_run:
     )
 
 # ---- Now apply the capacity governors (PF cap, then Total cap) ----
-  drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
+drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
 
     # -------- Governed Summary (store in session) --------
 daily_demand_total = float(drive_df["D_day_uplift"].sum())
