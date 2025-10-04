@@ -715,15 +715,15 @@ if just_clicked_run:
 
     # Apply governor on the driving union with PF cap awareness
     # ---- Normalize demand so sum(D_day_uplift) matches the file baseline (prevents over-count) ----
-baseline_daily_uplift = compute_uplifted_daily_baseline(sales_df, rrs_map_df)
-sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
-scale = 1.0
-if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
+   baseline_daily_uplift = compute_uplifted_daily_baseline(sales_df, rrs_map_df)
+   sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
+   scale = 1.0
+   if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
     scale = baseline_daily_uplift / sum_drive_daily_uplift
 
-if scale != 1.0:
+   if scale != 1.0:
     # Scale demand and all unit-based targets proportionally
-    for col in ["D_day", "D_day_uplift",
+     for col in ["D_day", "D_day_uplift",
                 "PF_Min_units_raw", "PF_Max_units_raw",
                 "PF_Min_units", "PF_Max_units",
                 "Bulk_Min_units", "Bulk_Max_units",
@@ -732,14 +732,14 @@ if scale != 1.0:
             drive_df[col] = (drive_df[col].astype(float) * scale)
 
     # Recompute cover days on scaled demand
-    drive_df["Final_DaysCover"] = np.where(
+     drive_df["Final_DaysCover"] = np.where(
         drive_df["D_day_uplift"]>0,
         drive_df["Final_Total"]/drive_df["D_day_uplift"],
         0.0
     )
 
 # ---- Now apply the capacity governors (PF cap, then Total cap) ----
-drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
+  drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
 
     # -------- Governed Summary (store in session) --------
 daily_demand_total = float(drive_df["D_day_uplift"].sum())
