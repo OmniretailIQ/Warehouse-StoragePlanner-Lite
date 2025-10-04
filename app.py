@@ -28,9 +28,11 @@ allow_stranger_overflow = st.sidebar.checkbox(
     value=False
 )
 overflow_dwell_days = st.sidebar.number_input(
-    "Overflow dwell cap (days)", min_value=1, value=3, step=1
+    "Overflow dwell cap (days)", min_value=1, value=3, step=1,
     help="Operational dwell limit for PF overflow inventory."
 )
+
+
 # ABC eligibility for PF overflow (configurable)
 pf_overflow_abc = st.sidebar.multiselect(
     "PF overflow eligible ABC classes",
@@ -38,6 +40,7 @@ pf_overflow_abc = st.sidebar.multiselect(
     default=["A","B"],
     help="Only these ABC classes can overflow into PF."
 )
+
 
 st.set_page_config(page_title="Warehouse Planner Lite (Sets)", layout="wide")
 
