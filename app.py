@@ -127,26 +127,38 @@ def rollup_rrs_majority_by_sku(sku_frame, keys, threshold=0.5):
     """
     df = sku_frame.copy()
     df["RRS_Class"] = df["RRS_Class"].fillna("Unknown")
+
+    # Count distinct SKUs per RRS within each set
     uni = df.drop_duplicates(subset=keys + ["invarticle_code","RRS_Class"])
-    cnt = uni.groupby(keys + ["RRS_Class"], dropna=False)["invarticle_code"].nunique().rename("sku_cnt").reset_index()
+    cnt = (uni.groupby(keys + ["RRS_Class"], dropna=False)["invarticle_code"]
+              .nunique().rename("sku_cnt").reset_index())
     tot = cnt.groupby(keys, dropna=False)["sku_cnt"].sum().rename("sku_tot")
     cnt = cnt.merge(tot, on=keys, how="left")
     cnt["share"] = cnt["sku_cnt"] / cnt["sku_tot"].replace(0, np.nan)
-    win = cnt.sort_values(keys + ["share","sku_cnt"], ascending=[True]*len(keys) + [False, False]) \
-             .drop_duplicates(subset=keys, keep="first")[keys + ["RRS_Class","share"]].copy()
-    need_fb = win["share"].fillna(0) < threshold
-    if need_fb.any():
-        qty = df.groupby(keys + ["RRS_Class"], dropna=False)["total_qty"].sum().rename("qty").reset_index()
-        pref = {"Repeater":3, "Runner":2, "Stranger":1, "Unknown":0}
-        qty["pref"] = qty["RRS_Class"].map(pref).fillna(-1)
-        fb = qty.sort_values(keys + ["pref","qty"], ascending=[True]*len(keys) + [False, False]) \
-                .drop_duplicates(subset=keys, keep="first")[keys + ["RRS_Class"]]
-        win = win.merge(fb, on=keys, how="left", suffixes=("","_FB"))
-        win.loc[need_fb, "RRS_Class"] = win.loc[need_fb, "RRS_Class_FB"]
-        win = win.drop(columns=["RRS_Class_FB","share"], errors="ignore")
-    else:
-        win = win.drop(columns=["share"], errors="ignore")
-    return win.rename(columns={"RRS_Class":"RRS_Class_Rolled"})
+
+    # Provisional winner = highest share
+    win = (cnt.sort_values(keys + ["share","sku_cnt"],
+                           ascending=[True]*len(keys) + [False, False])
+              .drop_duplicates(subset=keys, keep="first")[keys + ["RRS_Class","share"]].copy())
+
+    # Build fallback table by preference, tie-break by sales qty
+    qty = (df.groupby(keys + ["RRS_Class"], dropna=False)["total_qty"]
+             .sum().rename("qty").reset_index())
+    pref = {"Repeater":3, "Runner":2, "Stranger":1, "Unknown":0}
+    qty["pref"] = qty["RRS_Class"].map(pref).fillna(-1)
+    fb = (qty.sort_values(keys + ["pref","qty"],
+                          ascending=[True]*len(keys) + [False, False])
+             .drop_duplicates(subset=keys, keep="first")[keys + ["RRS_Class"]]
+             .rename(columns={"RRS_Class":"RRS_FB"}))
+
+    # Merge fallback; recompute mask AFTER merge so indices align
+    win = win.merge(fb, on=keys, how="left")
+    mask = win["share"].fillna(0) < float(threshold)
+    chosen = np.where(mask, win["RRS_FB"], win["RRS_Class"])
+
+    out = win[keys].copy()
+    out["RRS_Class_Rolled"] = pd.Series(chosen).fillna(win["RRS_Class"])
+    return out
 
 def rollup_abc_majority_by_sku(sku_frame, keys, threshold=0.5):
     """
@@ -154,33 +166,39 @@ def rollup_abc_majority_by_sku(sku_frame, keys, threshold=0.5):
     fallback to departmental Pareto on set sales (A to cum<=80%, B to 95%, else C).
     """
     df = sku_frame.copy()
-    df["ABC_Class"] = df["ABC_Class"].fillna(np.nan)
+    df["ABC_Class"] = df["ABC_Class"].astype(object)  # allow NaN
+    # Count distinct SKUs per ABC within each set
     uni = df.drop_duplicates(subset=keys + ["invarticle_code","ABC_Class"])
-    cnt = uni.groupby(keys + ["ABC_Class"], dropna=False)["invarticle_code"].nunique().rename("sku_cnt").reset_index()
+    cnt = (uni.groupby(keys + ["ABC_Class"], dropna=False)["invarticle_code"]
+              .nunique().rename("sku_cnt").reset_index())
     tot = cnt.groupby(keys, dropna=False)["sku_cnt"].sum().rename("sku_tot")
     cnt = cnt.merge(tot, on=keys, how="left")
     cnt["share"] = cnt["sku_cnt"] / cnt["sku_tot"].replace(0, np.nan)
-    win = cnt.sort_values(keys + ["share","sku_cnt"], ascending=[True]*len(keys) + [False, False]) \
-             .drop_duplicates(subset=keys, keep="first")[keys + ["ABC_Class","share"]].copy()
-    win.rename(columns={"ABC_Class":"ABC_Class_Rolled"}, inplace=True)
 
-    need_fb = win["share"].fillna(0) < threshold
-    if need_fb.any():
-        sales = df.groupby(keys, dropna=False)["total_qty"].sum().rename("set_qty").reset_index()
-        dept_keys = ["department"] if "department" in df.columns else ["division"]
-        tmp = sales.copy()
-        tmp = tmp.sort_values(dept_keys + ["set_qty"], ascending=[True]*len(dept_keys) + [False])
-        tmp["tot_dept"] = tmp.groupby(dept_keys, dropna=False)["set_qty"].transform("sum")
-        tmp["cum_share"] = tmp.groupby(dept_keys, dropna=False)["set_qty"].cumsum() / tmp["tot_dept"].replace(0, np.nan)
-        tmp["ABC_fb"] = np.where(tmp["cum_share"] <= 0.80, "A",
-                          np.where(tmp["cum_share"] <= 0.95, "B", "C"))
-        fb = tmp[keys + ["ABC_fb"]]
-        win = win.merge(fb, on=keys, how="left")
-        win.loc[need_fb, "ABC_Class_Rolled"] = win.loc[need_fb, "ABC_fb"]
-        win = win.drop(columns=["ABC_fb","share"], errors="ignore")
-    else:
-        win = win.drop(columns=["share"], errors="ignore")
-    return win
+    # Provisional winner
+    win = (cnt.sort_values(keys + ["share","sku_cnt"],
+                           ascending=[True]*len(keys) + [False, False])
+              .drop_duplicates(subset=keys, keep="first")[keys + ["ABC_Class","share"]].copy()
+              .rename(columns={"ABC_Class":"ABC_Prov"}))
+
+    # Departmental Pareto fallback (on set sales)
+    sales = df.groupby(keys, dropna=False)["total_qty"].sum().rename("set_qty").reset_index()
+    dept_keys = ["department"] if "department" in df.columns else ["division"]
+    tmp = sales.sort_values(dept_keys + ["set_qty"], ascending=[True]*len(dept_keys) + [False])
+    tmp["tot_dept"] = tmp.groupby(dept_keys, dropna=False)["set_qty"].transform("sum")
+    tmp["cum_share"] = tmp.groupby(dept_keys, dropna=False)["set_qty"].cumsum() / tmp["tot_dept"].replace(0, np.nan)
+    tmp["ABC_fb"] = np.where(tmp["cum_share"] <= 0.80, "A",
+                      np.where(tmp["cum_share"] <= 0.95, "B", "C"))
+    fb = tmp[keys + ["ABC_fb"]]
+
+    # Merge fallback; recompute mask AFTER merge so indices align
+    win = win.merge(fb, on=keys, how="left")
+    mask = win["share"].fillna(0) < float(threshold)
+    chosen = np.where(mask, win["ABC_fb"], win["ABC_Prov"])
+
+    out = win[keys].copy()
+    out["ABC_Class_Rolled"] = pd.Series(chosen).fillna(win["ABC_Prov"])
+    return out
 
 def build_sets(sales_df, abc_map_df, rrs_map_df, majority_threshold):
     keep = ["invarticle_code","article","department","division","section","sze","colour","brand","total_qty","Count of total_qty"]
