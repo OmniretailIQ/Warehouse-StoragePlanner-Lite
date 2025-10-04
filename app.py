@@ -3,6 +3,36 @@ import pandas as pd
 import numpy as np
 from io import BytesIO
 
+
+# ---------- PF Overflow controls ----------
+allow_pf_overflow = st.sidebar.checkbox(
+    "Allow PF overflow for Bulk when Bulk bins are full",
+    value=True,
+    help="Use spare PF capacity to soak Bulk pressure under guardrails."
+)
+
+pf_core_reserve_pct = st.sidebar.slider(
+    "PF core reserve (%) for true PF sets", 40, 90, 70,
+    help="This share of PF capacity is protected for PF-eligible sets."
+)
+pf_overflow_max_pct = st.sidebar.slider(
+    "PF overflow max band (%)", 0, 60, 30,
+    help="Upper band of PF capacity that overflow is allowed to consume."
+)
+overflow_density_max = st.sidebar.slider(
+    "Overflow density max (≤)", 4, 12, 8,
+    help="Only sets with density at or below this can overflow into PF."
+)
+allow_stranger_overflow = st.sidebar.checkbox(
+    "Allow Stranger sets in PF overflow (NOT recommended)",
+    value=False
+)
+overflow_dwell_days = st.sidebar.number_input(
+    "Overflow dwell cap (days)", min_value=1, value=3, step=1,
+    help="Operational dwell limit for PF overflow inventory."
+)
+
+
 st.set_page_config(page_title="Warehouse Planner Lite (Sets)", layout="wide")
 
 # -------------------- Session State Boot --------------------
@@ -470,6 +500,26 @@ def assign_bins(sets_df, bins_df, pf_or_bulk="PF"):
     }
     return pd.DataFrame(assigns), diag
 
+
+
+def pf_remaining_capacity_bins(bins_df, pf_assign_df):
+    """Return PF bins with remaining capacity after PF core assignment."""
+    pf_bins = bins_df[bins_df["bin_type"]=="PF"].copy()
+    if pf_bins.empty:
+        return pf_bins.assign(available=0)
+
+    used = pd.DataFrame(columns=["bin_code","Used"])
+    if pf_assign_df is not None and not pf_assign_df.empty:
+        used = (pf_assign_df.groupby("Bin_Code", as_index=False)["Assigned_Qty"]
+                          .sum().rename(columns={"Assigned_Qty":"Used"}))
+
+    out = pf_bins.merge(used, left_on="bin_code", right_on="bin_code", how="left")
+    out["Used"] = pd.to_numeric(out["Used"], errors="coerce").fillna(0).astype(int)
+    out["available"] = (out["capacity_units"] - out["Used"]).clip(lower=0)
+    # Sort in a stable walking order
+    out = out.sort_values(["zone","row","bay","level","bin_code"]).reset_index(drop=True)
+    return out[out["available"]>0].copy()
+
 def apply_capacity_governor(drive_df, cap_total_pcs, pf_cap_pcs=None):
     """
     Two-stage governor:
@@ -556,6 +606,60 @@ def build_consolidated(drive_df, pf_assign_df, bulk_assign_df):
     base = base[base_cols].copy()
     base["Set_Key"] = np.where(base["Set_Type"].eq("ColourSet"), base["colour"], base["size_norm"])
     base.rename(columns={"colour":"Colour", "size_norm":"Size"}, inplace=True)
+
+    # Aggregate PF bins
+    pf = pf_assign_df.copy() if pf_assign_df is not None else pd.DataFrame()
+    if not pf.empty:
+        pf["PF_Bin"] = pf["Zone"].astype(str)+"|R"+pf["Row"].astype(str)+"|B"+pf["Bay"].astype(str)+"|L"+pf["Level"].astype(str)
+        pf_g = pf.groupby("Set_ID", as_index=False).agg(
+            PF_Assigned_Qty=("Assigned_Qty","sum"),
+            PF_Bins=("PF_Bin", lambda s: "; ".join(map(str, s)))
+        )
+    else:
+        pf_g = base[["Set_ID"]].drop_duplicates().assign(PF_Assigned_Qty=0, PF_Bins="")
+
+    # Aggregate Bulk bins
+    bk = bulk_assign_df.copy() if bulk_assign_df is not None else pd.DataFrame()
+    if not bk.empty:
+        bk["Bulk_Bin"] = bk["Zone"].astype(str)+"|R"+bk["Row"].astype(str)+"|B"+bk["Bay"].astype(str)+"|L"+bk["Level"].astype(str)
+        bk_g = bk.groupby("Set_ID", as_index=False).agg(
+            Bulk_Assigned_Qty=("Assigned_Qty","sum"),
+            Bulk_Bins=("Bulk_Bin", lambda s: "; ".join(map(str, s)))
+        )
+    else:
+        bk_g = base[["Set_ID"]].drop_duplicates().assign(Bulk_Assigned_Qty=0, Bulk_Bins="")
+
+    # Join & compute residuals
+    cons = (base.merge(pf_g, on="Set_ID", how="left")
+                .merge(bk_g, on="Set_ID", how="left")
+                .fillna({"PF_Assigned_Qty":0, "Bulk_Assigned_Qty":0, "PF_Bins":"", "Bulk_Bins":""}))
+    cons["PF_Assigned_Qty"] = cons["PF_Assigned_Qty"].astype(int)
+    cons["Bulk_Assigned_Qty"] = cons["Bulk_Assigned_Qty"].astype(int)
+    cons["Total_Assigned_Qty"] = cons["PF_Assigned_Qty"] + cons["Bulk_Assigned_Qty"]
+
+    # --- NEW: remainder goes to CrossDock ---
+    cons["CrossDock_Qty"] = np.maximum(cons["Final_Total"] - cons["Total_Assigned_Qty"], 0).astype(int)
+    cons["Storage_Zone"] = np.where(cons["CrossDock_Qty"] > 0, "CrossDock", "Stored")
+    cons["Has_CrossDock"] = cons["CrossDock_Qty"] > 0
+    # ---------------------------------------
+
+    cons["Set_Label"] = cons["Set_Type"].str.replace("Set","",regex=False) + ":" + cons["Set_Key"].astype(str)
+
+    ordered = [
+        "Set_ID","Set_Type","Set_Label","division","department","brand","article","Colour","Size",
+        "ABC_Class_Rolled","RRS_Class_Rolled","Style_Density_Proxy","Zoning","Tier",
+        "D_day","D_day_uplift",
+        "PF_Min_days","PF_Max_days","PF_Min_units","PF_Max_units",
+        "Bulk_Min_units","Bulk_Max_units","Bulk_Final",
+        "Final_Total","Final_DaysCover",
+        "PF_Assigned_Qty","Bulk_Assigned_Qty","Total_Assigned_Qty",
+        "CrossDock_Qty","Storage_Zone","Has_CrossDock",
+        "PF_Bins","Bulk_Bins"
+    ]
+    for c in ordered:
+        if c not in cons.columns:
+            cons[c] = np.nan
+    return cons[ordered]
 
     pf = pf_assign_df.copy()
     if not pf.empty:
@@ -851,6 +955,112 @@ if just_clicked_run:
             pf_assign, pf_diag = assign_bins(drive_df, bins_df, pf_or_bulk="PF")
             bulk_assign, bulk_diag = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
 
+
+# ---------- Controlled PF Overflow from Bulk ----------
+if 'allow_pf_overflow' in globals() and allow_pf_overflow and bins_df is not None and not bins_df.empty:
+    # PF capacity & protection bands
+    pf_cap_total = int(bins_df.loc[bins_df["bin_type"]=="PF","capacity_units"].sum())
+    pf_core_cap   = int(pf_cap_total * (pf_core_reserve_pct/100.0))
+    pf_overflow_cap = int(pf_cap_total * ((pf_core_reserve_pct + pf_overflow_max_pct)/100.0))
+
+    pf_core_assigned = int(pf_assign["Assigned_Qty"].sum()) if ('pf_assign' in locals() and pf_assign is not None and not pf_assign.empty) else 0
+    # If core already spills beyond reserve, no room for overflow
+    overflow_room_units = max(0, pf_overflow_cap - pf_core_assigned)
+
+    # Remaining PF bin capacity map (after core PF)
+    pf_bins_left = pf_remaining_capacity_bins(bins_df, pf_assign if 'pf_assign' in locals() else None)
+    total_pf_left_units = int(pf_bins_left["available"].sum()) if (pf_bins_left is not None and not pf_bins_left.empty) else 0
+    overflow_room_units = min(overflow_room_units, total_pf_left_units)
+
+    if overflow_room_units > 0:
+        # How much Bulk is still unplaced?
+        bulk_used_by_set = pd.DataFrame(columns=["Set_ID","Bulk_Assigned_Qty"])
+        if 'bulk_assign' in locals() and bulk_assign is not None and not bulk_assign.empty:
+            bulk_used_by_set = (bulk_assign.groupby("Set_ID", as_index=False)["Assigned_Qty"]
+                                           .sum().rename(columns={"Assigned_Qty":"Bulk_Assigned_Qty"}))
+        need = (drive_df[["Set_ID","Set_Type","division","department","brand","article",
+                          "colour","size_norm","ABC_Class_Rolled","RRS_Class_Rolled",
+                          "Style_Density_Proxy","Zoning","Tier","D_day_uplift","Bulk_Final"]]
+                   .merge(bulk_used_by_set, on="Set_ID", how="left")
+                   .fillna({"Bulk_Assigned_Qty":0}))
+        need["Bulk_Remain"] = (need["Bulk_Final"] - need["Bulk_Assigned_Qty"]).clip(lower=0).astype(int)
+
+        # Eligibility filters for overflow
+        elig = need.copy()
+        elig = elig[elig["Bulk_Remain"] > 0]
+        elig = elig[elig["Zoning"].isin(["Bulk","PickFace+Bulk"])]
+        elig = elig[elig["Style_Density_Proxy"] <= overflow_density_max]
+        elig = elig[elig["ABC_Class_Rolled"].isin(["A","B"])]
+        if not allow_stranger_overflow:
+            elig = elig[elig["RRS_Class_Rolled"] != "Stranger"]
+
+        # Priority: Tier asc (1 best), D_day_uplift desc, density asc
+        elig = elig.sort_values(["Tier","D_day_uplift","Style_Density_Proxy"],
+                                ascending=[True, False, True]).reset_index(drop=True)
+
+        # Greedy fill into remaining PF bins
+        overflow_rows = []
+        bin_idx = 0
+        avail_col = pf_bins_left.columns.get_loc("available") if (pf_bins_left is not None and not pf_bins_left.empty) else None
+        remaining_allowance = int(overflow_room_units)
+
+        for _, row in elig.iterrows():
+            rem = int(row["Bulk_Remain"])
+            if rem <= 0:
+                continue
+            while rem > 0 and (pf_bins_left is not None and bin_idx is not None) and bin_idx < len(pf_bins_left) and remaining_allowance > 0:
+                b = pf_bins_left.iloc[bin_idx]
+                cap = int(b["available"])
+                if cap <= 0:
+                    bin_idx += 1
+                    continue
+                put = min(rem, cap, remaining_allowance)
+                overflow_rows.append({
+                    "Set_ID": row["Set_ID"],
+                    "Set_Type": row["Set_Type"],
+                    "Division": row["division"],
+                    "Department": row["department"],
+                    "Brand": row["brand"],
+                    "Article": row["article"],
+                    "Colour_or_Size": row.get("colour") if pd.notna(row.get("colour")) else row.get("size_norm"),
+                    "ABC": row["ABC_Class_Rolled"],
+                    "RRS": row["RRS_Class_Rolled"],
+                    "Zoning": row["Zoning"],
+                    "Assigned_Qty": int(put),
+                    "Bin_Code": b["bin_code"],
+                    "Zone": b["zone"],
+                    "Row": b["row"],
+                    "Bay": b["bay"],
+                    "Level": b["level"],
+                    "Tier": b["tier"],
+                    "Bin_Type": "PF_OVERFLOW",
+                    "Overflow_Expiry_Days": int(overflow_dwell_days)
+                })
+                rem -= put
+                remaining_allowance -= put
+                pf_bins_left.iat[bin_idx, avail_col] = cap - put
+                if pf_bins_left.iat[bin_idx, avail_col] <= 0:
+                    bin_idx += 1
+            if (pf_bins_left is None) or bin_idx >= len(pf_bins_left) or remaining_allowance <= 0:
+                break
+
+        if overflow_rows:
+            pf_overflow_df = pd.DataFrame(overflow_rows)
+            # Add to PF assignments (keeps them visible downstream)
+            if 'pf_assign' in locals() and pf_assign is not None and not pf_assign.empty:
+                pf_assign = pd.concat([pf_assign, pf_overflow_df], ignore_index=True).reset_index(drop=True)
+            else:
+                pf_assign = pf_overflow_df.copy()
+
+            # Update diagnostics to reflect extra PF usage safely
+            try:
+                extra_pf = int(pf_overflow_df["Assigned_Qty"].sum())
+                if 'pf_diag' in locals() and isinstance(pf_diag, dict):
+                    pf_diag["assigned_units"] = int(pf_diag.get("assigned_units", 0)) + extra_pf
+            except Exception:
+                pass
+
+
     # Reason codes
     drive_flags = drive_df.copy()
     drive_flags["PF_Eligible"] = drive_flags["Zoning"].eq("PickFace+Bulk")
@@ -876,6 +1086,27 @@ if just_clicked_run:
         return ""
 
     consolidated_df = build_consolidated(drive_df, pf_assign, bulk_assign)
+
+
+# -------- Cross-Dock Summary --------
+st.subheader("Cross-Dock Summary")
+total_need_units = int(consolidated_df["Final_Total"].sum())
+total_assigned_units = int(consolidated_df["Total_Assigned_Qty"].sum())
+total_crossdock_units = int(consolidated_df["CrossDock_Qty"].sum())
+pct_crossdock = (100.0 * total_crossdock_units / total_need_units) if total_need_units > 0 else 0.0
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    st.metric("Total need (pcs)", f"{total_need_units:,}")
+with c2:
+    st.metric("Assigned (PF+Bulk)", f"{total_assigned_units:,}")
+with c3:
+    st.metric("Cross-Dock (pcs)", f"{total_crossdock_units:,}")
+with c4:
+    st.metric("% Cross-Dock", f"{pct_crossdock:.1f}%")
+
+st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
+
     consolidated_df = consolidated_df.merge(pf_flags, on="Set_ID", how="left").merge(bk_flags, on="Set_ID", how="left")
     consolidated_df["PF_Reason"] = consolidated_df.apply(reason_pf, axis=1)
     consolidated_df["Bulk_Reason"] = consolidated_df.apply(reason_bulk, axis=1)
