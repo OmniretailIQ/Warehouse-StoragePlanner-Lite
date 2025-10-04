@@ -7,7 +7,7 @@ st.set_page_config(page_title="Warehouse Planner Lite (Sets)", layout="wide")
 
 # -------------------- Session State Boot --------------------
 for k in ["results_ready", "colour_final", "size_final", "pf_assign", "bulk_assign",
-          "drive_df", "consolidated_df", "pf_diag", "bulk_diag"]:
+          "drive_df", "consolidated_df", "pf_diag", "bulk_diag", "gov_summary"]:
     if k not in st.session_state:
         st.session_state[k] = None
 
@@ -58,6 +58,9 @@ for key, (dmin, dmax) in def_val.items():
 hybrid_mode = st.sidebar.checkbox("Hybrid allocation (auto choose Colour vs Size per article)", value=True)
 st.sidebar.caption("Hybrid mode avoids double counting by selecting one axis per article/family.")
 override_file = st.sidebar.file_uploader("Optional: Axis Overrides CSV (division,department,brand,article,force_axis)", type=["csv"])
+
+# Kanban toggle (optional operational export)
+show_kanban = st.sidebar.checkbox("🔁 Show Kanban triggers (PF/Bulk Min Units only)", value=False)
 
 # -------------------- Page header --------------------
 st.title("Warehouse Planner Lite — Set-level (Colour/Size)")
@@ -376,25 +379,76 @@ def assign_bins(sets_df, bins_df, pf_or_bulk="PF"):
     }
     return pd.DataFrame(assigns), diag
 
-def apply_capacity_governor(drive_df, cap_total_pcs):
+def apply_capacity_governor(drive_df, cap_total_pcs, pf_cap_pcs=None):
+    """
+    Two-stage governor:
+      A) Cap PF_Max_units by PF physical capacity (if provided) by trimming Tier 5→1 toward PF_Min_units.
+         If still over PF cap, allow dipping below PF_Min (last resort), Tier 5→1.
+      B) Cap Total (PF + Bulk_Final) to warehouse capacity by trimming Bulk_Final Tier 5→1 toward Bulk_Min_units.
+         If still over, trim PF below PF_Min (last resort), Tier 5→1.
+    """
     df = drive_df.copy()
+
+    # --- Stage A: PF physical capacity cap (optional) ---
+    if pf_cap_pcs is not None and np.isfinite(pf_cap_pcs):
+        pf_sum = int(df["PF_Max_units"].sum())
+        pf_surplus = max(pf_sum - int(pf_cap_pcs), 0)
+        if pf_surplus > 0:
+            # Reduce PF down to PF_Min by tier 5→1
+            for t in [5,4,3,2,1]:
+                if pf_surplus <= 0: break
+                mask = (df["Tier"]==t) & (df["PF_Max_units"] > df["PF_Min_units"])
+                flex = (df.loc[mask, "PF_Max_units"] - df.loc[mask, "PF_Min_units"]).clip(lower=0)
+                flex_sum = int(flex.sum())
+                if flex_sum > 0:
+                    share = pf_surplus * (flex / flex_sum)
+                    df.loc[mask, "PF_Max_units"] = (df.loc[mask, "PF_Max_units"] - share.clip(upper=flex)).round().astype(int)
+                    pf_sum = int(df["PF_Max_units"].sum())
+                    pf_surplus = max(pf_sum - int(pf_cap_pcs), 0)
+
+            # If still over PF cap, allow dipping below PF_Min (last resort)
+            if pf_surplus > 0:
+                for t in [5,4,3,2,1]:
+                    if pf_surplus <= 0: break
+                    mask = (df["Tier"]==t) & (df["PF_Max_units"] > 0)
+                    flex = df.loc[mask, "PF_Max_units"].clip(lower=0)
+                    flex_sum = int(flex.sum())
+                    if flex_sum > 0:
+                        share = pf_surplus * (flex / flex_sum)
+                        df.loc[mask, "PF_Max_units"] = (df.loc[mask, "PF_Max_units"] - share.clip(upper=flex)).round().astype(int)
+                        pf_sum = int(df["PF_Max_units"].sum())
+                        pf_surplus = max(pf_sum - int(pf_cap_pcs), 0)
+
+    # --- Stage B: total warehouse cap ---
     projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
-    surplus = max(projected - cap_total_pcs, 0)
-    if surplus <= 0:
-        df["Final_Total"] = df["PF_Max_units"] + df["Bulk_Final"]
-        df["Final_DaysCover"] = np.where(df["D_day_uplift"]>0, df["Final_Total"]/df["D_day_uplift"], 0.0)
-        return df
-    # reduce tiers 5→1
-    for t in [5,4,3,2,1]:
-        if surplus <= 0: break
-        mask = df["Tier"]==t
-        flex = (df.loc[mask,"Bulk_Final"] - df.loc[mask,"Bulk_Min_units"]).clip(lower=0)
-        flex_sum = int(flex.sum())
-        if flex_sum>0:
-            share = surplus * (flex / flex_sum)
-            df.loc[mask,"Bulk_Final"] = (df.loc[mask,"Bulk_Final"] - share.clip(upper=flex)).round().astype(int)
-            projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
-            surplus = max(projected - cap_total_pcs, 0)
+    surplus = max(projected - int(cap_total_pcs), 0)
+    if surplus > 0:
+        # First trim Bulk down to Bulk_Min, Tier 5→1
+        for t in [5,4,3,2,1]:
+            if surplus <= 0: break
+            mask = df["Tier"]==t
+            flex = (df.loc[mask,"Bulk_Final"] - df.loc[mask,"Bulk_Min_units"]).clip(lower=0)
+            flex_sum = int(flex.sum())
+            if flex_sum>0:
+                share = surplus * (flex / flex_sum)
+                df.loc[mask,"Bulk_Final"] = (df.loc[mask,"Bulk_Final"] - share.clip(upper=flex)).round().astype(int)
+                projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
+                surplus = max(projected - int(cap_total_pcs), 0)
+
+    if surplus > 0:
+        # Still over? Trim PF further (below PF_Min), Tier 5→1 (last resort)
+        for t in [5,4,3,2,1]:
+            if surplus <= 0: break
+            mask = (df["Tier"]==t) & (df["PF_Max_units"] > 0)
+            flex = df.loc[mask,"PF_Max_units"].clip(lower=0)
+            flex_sum = int(flex.sum())
+            if flex_sum>0:
+                share = surplus * (flex / flex_sum)
+                df.loc[mask,"PF_Max_units"] = (df.loc[mask,"PF_Max_units"] - share.clip(upper=flex)).round().astype(int)
+                projected = int(df["PF_Max_units"].sum() + df["Bulk_Final"].sum())
+                surplus = max(projected - int(cap_total_pcs), 0)
+
+    # Recompute finals
     df["Final_Total"] = df["PF_Max_units"] + df["Bulk_Final"]
     df["Final_DaysCover"] = np.where(df["D_day_uplift"]>0, df["Final_Total"]/df["D_day_uplift"], 0.0)
     return df
@@ -458,6 +512,63 @@ def build_consolidated(drive_df, pf_assign_df, bulk_assign_df):
         if c not in cons.columns:
             cons[c] = np.nan
     return cons[ordered]
+
+def build_kanban_triggers(drive_df, pf_assign_df, bulk_assign_df):
+    """Compact, ops-ready table of Kanban cards for PF and Bulk."""
+    base_cols = [
+        "Set_ID","Set_Type","division","department","brand","article",
+        "colour","size_norm","ABC_Class_Rolled","RRS_Class_Rolled","Tier",
+        "Zoning","D_day_uplift","PF_Min_units","PF_Max_units",
+        "Bulk_Min_units","Bulk_Final"
+    ]
+    df = drive_df[base_cols].copy()
+    df["Set_Key"] = np.where(df["Set_Type"].eq("ColourSet"), df["colour"], df["size_norm"])
+    df["Set_Label"] = df["Set_Type"].str.replace("Set","",regex=False) + ":" + df["Set_Key"].astype(str)
+    df.rename(columns={"colour":"Colour","size_norm":"Size"}, inplace=True)
+
+    # PF bins compact list for each set (may be empty)
+    pf_bins = pd.DataFrame(columns=["Set_ID","PF_Bins"])
+    if pf_assign_df is not None and not pf_assign_df.empty:
+        t = pf_assign_df.copy()
+        t["PF_Bin"] = t["Zone"].astype(str)+"|R"+t["Row"].astype(str)+"|B"+t["Bay"].astype(str)+"|L"+t["Level"].astype(str)
+        pf_bins = t.groupby("Set_ID", as_index=False).agg(PF_Bins=("PF_Bin", lambda s: "; ".join(map(str, s))))
+
+    # Bulk bins compact list
+    bk_bins = pd.DataFrame(columns=["Set_ID","Bulk_Bins"])
+    if bulk_assign_df is not None and not bulk_assign_df.empty:
+        t = bulk_assign_df.copy()
+        t["Bulk_Bin"] = t["Zone"].astype(str)+"|R"+t["Row"].astype(str)+"|B"+t["Bay"].astype(str)+"|L"+t["Level"].astype(str)
+        bk_bins = t.groupby("Set_ID", as_index=False).agg(Bulk_Bins=("Bulk_Bin", lambda s: "; ".join(map(str, s))))
+
+    # PF Kanban rows (PF-eligible + has a min > 0)
+    pf_df = df[(df["Zoning"].eq("PickFace+Bulk")) & (df["PF_Min_units"]>0)].copy()
+    pf_df["Area"] = "PF"
+    pf_df["Min_Qty"] = pf_df["PF_Min_units"].astype(int)
+    pf_df["Target_Qty"] = pf_df["PF_Max_units"].astype(int)
+    pf_df = pf_df.merge(pf_bins, on="Set_ID", how="left")
+    pf_df["Bins"] = pf_df["PF_Bins"].fillna("")
+    pf_df.drop(columns=["PF_Bins"], inplace=True)
+
+    # Bulk Kanban rows (Bulk or PF+Bulk with a bulk min > 0)
+    bk_df = df[df["Zoning"].isin(["PickFace+Bulk","Bulk"]) & (df["Bulk_Min_units"]>0)].copy()
+    bk_df["Area"] = "BULK"
+    bk_df["Min_Qty"] = bk_df["Bulk_Min_units"].astype(int)
+    bk_df["Target_Qty"] = bk_df["Bulk_Final"].astype(int)  # governed target
+    bk_df = bk_df.merge(bk_bins, on="Set_ID", how="left")
+    bk_df["Bins"] = bk_df["Bulk_Bins"].fillna("")
+    bk_df.drop(columns=["Bulk_Bins"], inplace=True)
+
+    # Combine and compute implied days at min/target
+    out = pd.concat([pf_df, bk_df], ignore_index=True)
+    out["Implied_Min_Days"] = np.where(out["D_day_uplift"]>0, out["Min_Qty"]/out["D_day_uplift"], 0.0)
+    out["Implied_Target_Days"] = np.where(out["D_day_uplift"]>0, out["Target_Qty"]/out["D_day_uplift"], 0.0)
+
+    cols = [
+        "Set_ID","Set_Type","Set_Label","division","department","brand","article","Colour","Size",
+        "ABC_Class_Rolled","RRS_Class_Rolled","Tier","Area",
+        "Min_Qty","Target_Qty","Implied_Min_Days","Implied_Target_Days","D_day_uplift","Bins"
+    ]
+    return out[cols].sort_values(["Area","Tier","department","brand","article","Set_Label"]).reset_index(drop=True)
 
 # -------------------- Run / Display (Session-State) --------------------
 if just_clicked_run:
@@ -524,7 +635,6 @@ if just_clicked_run:
         # Hybrid allocation decision (per article)
         art_keys = ["division","department","brand","article"]
         if hybrid_mode:
-            # metrics on lowercase source columns
             c_metrics = colour_final.groupby(art_keys, dropna=False).agg(
                 colour_span=("colour","nunique"),
                 colour_sku=("SKU_Count","sum"),
@@ -568,22 +678,42 @@ if just_clicked_run:
             drive_colour = colour_with_axis[colour_with_axis["chosen_axis"].eq("ColourSet")].copy()
             drive_size   = size_with_axis[size_with_axis["chosen_axis"].eq("SizeSet")].copy()
             drive_df = pd.concat([drive_colour, drive_size], ignore_index=True)
-
-            # Apply capacity governor on driving union
-            drive_df = apply_capacity_governor(drive_df, cap_total)
         else:
+            # Non-hybrid simple mode: choose one axis in sidebar (default ColourSets)
             alloc_axis = st.sidebar.radio("Allocation axis (non-hybrid)", options=["ColourSets","SizeSets"], index=0)
-            if alloc_axis == "ColourSets":
-                drive_df = apply_capacity_governor(colour_final.copy(), cap_total)
-            else:
-                drive_df = apply_capacity_governor(size_final.copy(), cap_total)
+            drive_df = colour_final.copy() if alloc_axis=="ColourSets" else size_final.copy()
+
+    # Compute optional PF capacity from Bin Master (for governor)
+    pf_cap = None
+    if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
+        pf_cap = int(bins_df.loc[bins_df["bin_type"]=="PF","capacity_units"].sum())
+
+    # Apply governor on the driving union with PF cap awareness
+    drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
+
+    # -------- Governed Summary (store in session) --------
+    daily_demand_total = float(drive_df["D_day_uplift"].sum())
+    pf_need = int(drive_df["PF_Max_units"].sum())
+    bulk_need = int(drive_df["Bulk_Final"].sum())
+    total_need = pf_need + bulk_need
+    gov_cover_days = (total_need / daily_demand_total) if daily_demand_total > 0 else 0.0
+    st.session_state["gov_summary"] = {
+        "pf_cap": int(pf_cap) if pf_cap is not None else None,
+        "pf_need": pf_need,
+        "pf_cap_util": (pf_need / pf_cap) if pf_cap else None,
+        "total_cap": int(cap_total),
+        "total_need": int(total_need),
+        "bulk_need": int(bulk_need),
+        "daily_demand": daily_demand_total,
+        "cover_days": float(gov_cover_days),
+    }
 
     # Racking assignment (only driving pool) + diagnostics
     pf_assign = pd.DataFrame()
     bulk_assign = pd.DataFrame()
     pf_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
     bulk_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
-    if bins_df is not None:
+    if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
         with st.spinner("Assigning sets to PF/Bulk bins..."):
             pf_assign, pf_diag = assign_bins(drive_df, bins_df, pf_or_bulk="PF")
             bulk_assign, bulk_diag = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
@@ -638,9 +768,36 @@ if st.session_state["results_ready"]:
     consolidated_df = st.session_state["consolidated_df"]
     pf_diag = st.session_state["pf_diag"] or {}
     bulk_diag = st.session_state["bulk_diag"] or {}
+    gs = st.session_state.get("gov_summary", {}) or {}
 
     st.success("Planner run complete. Explore below and download outputs.")
     st.caption("Hybrid allocation (if enabled) selects Colour or Size per article; racking & capacity use the chosen axis only.")
+
+    # -------- Governed Summary panel --------
+    st.subheader("Governed Summary")
+    colA, colB, colC, colD = st.columns(4)
+    with colA:
+        pf_need_val = gs.get("pf_need", 0)
+        pf_cap_val = gs.get("pf_cap")
+        st.metric("PF need (pcs)", f"{pf_need_val:,}",
+                  delta=(f"cap {pf_cap_val:,}" if pf_cap_val is not None else None))
+    with colB:
+        util = gs.get("pf_cap_util")
+        st.metric("PF cap utilisation",
+                  f"{util*100:.1f}%" if util is not None else "—")
+    with colC:
+        st.metric("Total governed (pcs)",
+                  f"{gs.get('total_need', 0):,}",
+                  delta=f"cap {gs.get('total_cap', 0):,}")
+    with colD:
+        st.metric("Implied cover (days)",
+                  f"{gs.get('cover_days', 0.0):.1f}")
+    st.caption(f"Uplifted daily demand used: {gs.get('daily_demand', 0):,.0f} pcs/day")
+
+    if util is not None and util > 1.0:
+        st.warning("PF need exceeds PF physical capacity. Targets were trimmed, but please review PF thresholds or slot capacity.")
+    if gs.get("total_need", 0) > gs.get("total_cap", 0):
+        st.warning("Governed total still above capacity. Review cover bands/density thresholds.")
 
     # ColourSets
     st.subheader("Colour Sets — Zoning & Min–Max (preview)")
@@ -724,17 +881,39 @@ if st.session_state["results_ready"]:
         use_container_width=True
     )
 
+    # --- Kanban triggers (optional) ---
+    kanban_df = None
+    if show_kanban:
+        st.subheader("🔁 Kanban Triggers — PF/Bulk (operational)")
+        kanban_df = build_kanban_triggers(drive_df, pf_assign, bulk_assign)
+        st.dataframe(kanban_df.head(500))
+        st.caption(f"Kanban rows: {len(kanban_df):,}  •  One row per trigger (PF or BULK) with target replenishment level.")
+        st.download_button(
+            "Download Kanban Triggers (CSV)",
+            data=kanban_df.to_csv(index=False).encode("utf-8"),
+            file_name="Kanban_Triggers.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
     # Excel export (full)
-    def to_excel(col_df, size_df, pf_df=None, bulk_df=None, consolidated=None):
+    def to_excel(col_df, size_df, pf_df=None, bulk_df=None, consolidated=None, kanban=None):
         output = BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            pd.DataFrame({"Notes":[
+            # README + governed summary snapshot
+            notes = [
                 "Warehouse Planner Lite Output",
-                "Tabs: ColourSets, SizeSets, PF_Assignments, Bulk_Assignments, Consolidated.",
+                "Tabs: ColourSets, SizeSets, PF_Assignments, Bulk_Assignments, Consolidated, (optional) Kanban.",
                 "Zone=floor; Tier=F00->1; PF levels <= user setting (default 1–3); capacity per slot configurable.",
                 "Hybrid mode selects Colour or Size per article; only the chosen axis feeds capacity & racking.",
                 "Reason codes indicate why PF/Bulk bins may be blank in Consolidated."
-            ]}).to_excel(writer, sheet_name="README", index=False)
+            ]
+            gs_loc = st.session_state.get("gov_summary", {}) or {}
+            if gs_loc:
+                notes.append(f"Governed PF need: {gs_loc.get('pf_need',0):,}  | PF cap: {gs_loc.get('pf_cap',0) if gs_loc.get('pf_cap') else '—'}")
+                notes.append(f"Governed Total: {gs_loc.get('total_need',0):,}  | Total cap: {gs_loc.get('total_cap',0):,}  | Cover days: {gs_loc.get('cover_days',0):.1f}")
+            pd.DataFrame({"Notes":notes}).to_excel(writer, sheet_name="README", index=False)
+
             col_df.to_excel(writer, sheet_name="ColourSets", index=False)
             size_df.to_excel(writer, sheet_name="SizeSets", index=False)
             if pf_df is not None and not pf_df.empty:
@@ -743,9 +922,11 @@ if st.session_state["results_ready"]:
                 bulk_df.to_excel(writer, sheet_name="Bulk_Assignments", index=False)
             if consolidated is not None and not consolidated.empty:
                 consolidated.to_excel(writer, sheet_name="Consolidated", index=False)
+            if kanban is not None and isinstance(kanban, pd.DataFrame) and not kanban.empty:
+                kanban.to_excel(writer, sheet_name="Kanban", index=False)
         return output.getvalue()
 
-    xls_bytes = to_excel(colour_final, size_final, pf_assign, bulk_assign, consolidated_df)
+    xls_bytes = to_excel(colour_final, size_final, pf_assign, bulk_assign, consolidated_df, kanban_df)
     st.download_button(
         "Download Planner Output (Excel, full)",
         data=xls_bytes,
@@ -756,12 +937,14 @@ if st.session_state["results_ready"]:
 
     # Optional: Reset
     if st.button("Clear Results"):
-        for k in ["results_ready","colour_final","size_final","pf_assign","bulk_assign","drive_df","consolidated_df","pf_diag","bulk_diag"]:
+        for k in ["results_ready","colour_final","size_final","pf_assign","bulk_assign","drive_df",
+                  "consolidated_df","pf_diag","bulk_diag","gov_summary"]:
             st.session_state[k] = None
         st.experimental_rerun()
 
 else:
     st.info("Upload files (and optional Bin Master) then click **Run Planner**.")
+
 
 
 
