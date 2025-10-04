@@ -591,6 +591,7 @@ def apply_capacity_governor(drive_df, cap_total_pcs, pf_cap_pcs=None):
     df["Final_DaysCover"] = np.where(df["D_day_uplift"]>0, df["Final_Total"]/df["D_day_uplift"], 0.0)
     return df
 
+
 def build_consolidated(drive_df, pf_assign_df, bulk_assign_df):
     base_cols = [
         "Set_ID","Set_Type","division","department","brand","article",
@@ -639,11 +640,13 @@ def build_consolidated(drive_df, pf_assign_df, bulk_assign_df):
     cons["Bulk_Assigned_Qty"] = cons["Bulk_Assigned_Qty"].astype(int)
     cons["Total_Assigned_Qty"] = cons["PF_Assigned_Qty"] + cons["Bulk_Assigned_Qty"]
 
-    # --- NEW: remainder goes to CrossDock ---
-    cons["CrossDock_Qty"] = np.maximum(cons["Final_Total"] - cons["Total_Assigned_Qty"], 0).astype(int)
+    # --- NEW (tolerant): remainder goes to CrossDock ---
+    diff = np.round(cons["Final_Total"].astype(float) - cons["Total_Assigned_Qty"].astype(float), 3)
+    cons["CrossDock_Qty"] = np.where(diff > 0.5, diff.round().astype(int), 0)
     cons["Storage_Zone"] = np.where(cons["CrossDock_Qty"] > 0, "CrossDock", "Stored")
     cons["Has_CrossDock"] = cons["CrossDock_Qty"] > 0
-    # ---------------------------------------
+    cons["CrossDock_Pct"] = np.where(cons["Final_Total"]>0, 100.0*cons["CrossDock_Qty"]/cons["Final_Total"], 0.0)
+    # ---------------------------------------------------
 
     cons["Set_Label"] = cons["Set_Type"].str.replace("Set","",regex=False) + ":" + cons["Set_Key"].astype(str)
 
@@ -655,7 +658,7 @@ def build_consolidated(drive_df, pf_assign_df, bulk_assign_df):
         "Bulk_Min_units","Bulk_Max_units","Bulk_Final",
         "Final_Total","Final_DaysCover",
         "PF_Assigned_Qty","Bulk_Assigned_Qty","Total_Assigned_Qty",
-        "CrossDock_Qty","Storage_Zone","Has_CrossDock",
+        "CrossDock_Qty","CrossDock_Pct","Storage_Zone","Has_CrossDock",
         "PF_Bins","Bulk_Bins"
     ]
     for c in ordered:
@@ -1110,7 +1113,32 @@ if isinstance(_cons_df, pd.DataFrame) and not _cons_df.empty:
     with c4:
         st.metric("% Cross-Dock", f"{pct_crossdock:.1f}%")
 
-    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
+    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment."
+
+
+# ---- PF overflow absorption metrics ----
+_pf_assign = st.session_state.get("pf_assign", globals().get("pf_assign"))
+_bulk_diag = st.session_state.get("bulk_diag", globals().get("bulk_diag", {})) or {}
+try:
+    pf_overflow_units = int(_pf_assign.loc[_pf_assign["Bin_Type"]=="PF_OVERFLOW","Assigned_Qty"].sum()) if (_pf_assign is not None and not _pf_assign.empty) else 0
+except Exception:
+    pf_overflow_units = 0
+
+try:
+    bulk_need_total = int(_cons_df["Bulk_Final"].sum())
+    bulk_assigned_total = int(_cons_df["Bulk_Assigned_Qty"].sum())
+    bulk_unassigned_units = max(bulk_need_total - bulk_assigned_total, 0)
+except Exception:
+    bulk_unassigned_units = max(int(_bulk_diag.get("total_need_units", 0)) - int(_bulk_diag.get("assigned_units", 0)), 0)
+
+overflow_absorb_pct = (100.0 * pf_overflow_units / bulk_unassigned_units) if bulk_unassigned_units > 0 else 0.0
+
+c5, c6 = st.columns(2)
+with c5:
+    st.metric("PF overflow absorbed (pcs)", f"{pf_overflow_units:,}")
+with c6:
+    st.metric("% of Bulk overflow absorbed", f"{overflow_absorb_pct:.1f}%")
+)
 
 
 
@@ -1174,7 +1202,32 @@ if isinstance(_cons_df, pd.DataFrame) and not _cons_df.empty:
     with c4:
         st.metric("% Cross-Dock", f"{pct_crossdock:.1f}%")
 
-    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
+    st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment."
+
+
+# ---- PF overflow absorption metrics ----
+_pf_assign = st.session_state.get("pf_assign", globals().get("pf_assign"))
+_bulk_diag = st.session_state.get("bulk_diag", globals().get("bulk_diag", {})) or {}
+try:
+    pf_overflow_units = int(_pf_assign.loc[_pf_assign["Bin_Type"]=="PF_OVERFLOW","Assigned_Qty"].sum()) if (_pf_assign is not None and not _pf_assign.empty) else 0
+except Exception:
+    pf_overflow_units = 0
+
+try:
+    bulk_need_total = int(_cons_df["Bulk_Final"].sum())
+    bulk_assigned_total = int(_cons_df["Bulk_Assigned_Qty"].sum())
+    bulk_unassigned_units = max(bulk_need_total - bulk_assigned_total, 0)
+except Exception:
+    bulk_unassigned_units = max(int(_bulk_diag.get("total_need_units", 0)) - int(_bulk_diag.get("assigned_units", 0)), 0)
+
+overflow_absorb_pct = (100.0 * pf_overflow_units / bulk_unassigned_units) if bulk_unassigned_units > 0 else 0.0
+
+c5, c6 = st.columns(2)
+with c5:
+    st.metric("PF overflow absorbed (pcs)", f"{pf_overflow_units:,}")
+with c6:
+    st.metric("% of Bulk overflow absorbed", f"{overflow_absorb_pct:.1f}%")
+)
 
 
 
