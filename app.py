@@ -1112,15 +1112,15 @@ consolidated_df["PF_Reason"] = consolidated_df.apply(reason_pf, axis=1)
 consolidated_df["Bulk_Reason"] = consolidated_df.apply(reason_bulk, axis=1)
 
     # Save to session
-    st.session_state["colour_final"] = colour_final
-    st.session_state["size_final"] = size_final
-    st.session_state["pf_assign"] = pf_assign
-    st.session_state["bulk_assign"] = bulk_assign
-    st.session_state["drive_df"] = drive_df
-    st.session_state["consolidated_df"] = consolidated_df
-    st.session_state["pf_diag"] = pf_diag
-    st.session_state["bulk_diag"] = bulk_diag
-    st.session_state["results_ready"] = True
+st.session_state["colour_final"] = colour_final
+st.session_state["size_final"] = size_final
+st.session_state["pf_assign"] = pf_assign
+st.session_state["bulk_assign"] = bulk_assign
+st.session_state["drive_df"] = drive_df
+st.session_state["consolidated_df"] = consolidated_df
+st.session_state["pf_diag"] = pf_diag
+st.session_state["bulk_diag"] = bulk_diag
+st.session_state["results_ready"] = True
 
 # -------------------- Display from session --------------------
 if st.session_state["results_ready"]:
