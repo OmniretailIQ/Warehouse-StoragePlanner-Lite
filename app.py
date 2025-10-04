@@ -769,14 +769,14 @@ if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.emp
             bulk_assign, bulk_diag = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
 
     # Reason codes (why bins may be blank)
-    drive_flags = drive_df.copy()
-    drive_flags["PF_Eligible"] = drive_flags["Zoning"].eq("PickFace+Bulk")
-    drive_flags["PF_Need"] = drive_flags["PF_Max_units"].fillna(0).astype(int)
-    drive_flags["Bulk_Need"] = drive_flags["Bulk_Final"].fillna(0).astype(int)
-    pf_flags = drive_flags[["Set_ID","PF_Eligible","PF_Need"]].drop_duplicates()
-    bk_flags = drive_flags[["Set_ID","Bulk_Need"]].drop_duplicates()
+drive_flags = drive_df.copy()
+drive_flags["PF_Eligible"] = drive_flags["Zoning"].eq("PickFace+Bulk")
+drive_flags["PF_Need"] = drive_flags["PF_Max_units"].fillna(0).astype(int)
+drive_flags["Bulk_Need"] = drive_flags["Bulk_Final"].fillna(0).astype(int)
+pf_flags = drive_flags[["Set_ID","PF_Eligible","PF_Need"]].drop_duplicates()
+bk_flags = drive_flags[["Set_ID","Bulk_Need"]].drop_duplicates()
 
-    def reason_pf(row):
+def reason_pf(row):
         if not bool(row.get("PF_Eligible", False)):
             return "Not PF-eligible (zoning)"
         if int(row.get("PF_Min_units",0))==0 and int(row.get("PF_Max_units",0))==0:
@@ -785,17 +785,17 @@ if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.emp
             return "No PF bins available / capacity exhausted"
         return ""
 
-    def reason_bulk(row):
+def reason_bulk(row):
         if int(row.get("Bulk_Min_units",0))==0 and int(row.get("Bulk_Final",0))==0:
             return "No Bulk need (or squeezed by capacity governor)"
         if int(row.get("Bulk_Assigned_Qty",0))==0:
             return "No Bulk bins available / capacity exhausted"
         return ""
 
-    consolidated_df = build_consolidated(drive_df, pf_assign, bulk_assign)
-    consolidated_df = consolidated_df.merge(pf_flags, on="Set_ID", how="left").merge(bk_flags, on="Set_ID", how="left")
-    consolidated_df["PF_Reason"] = consolidated_df.apply(reason_pf, axis=1)
-    consolidated_df["Bulk_Reason"] = consolidated_df.apply(reason_bulk, axis=1)
+consolidated_df = build_consolidated(drive_df, pf_assign, bulk_assign)
+consolidated_df = consolidated_df.merge(pf_flags, on="Set_ID", how="left").merge(bk_flags, on="Set_ID", how="left")
+consolidated_df["PF_Reason"] = consolidated_df.apply(reason_pf, axis=1)
+consolidated_df["Bulk_Reason"] = consolidated_df.apply(reason_bulk, axis=1)
 
     # Save to session
     st.session_state["colour_final"] = colour_final
