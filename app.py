@@ -512,10 +512,10 @@ if just_clicked_run:
         if hybrid_mode:
             art_keys = ["division","department","brand","article"]
             c_metrics = colour_final.groupby(art_keys, dropna=False).agg(
-                colour_span=("Colour","nunique"),
-                colour_sku=("SKU_Count","sum"),
-                colour_qty=("Total_Qty_Q1","sum"),
-                colour_density=("Style_Density_Proxy","mean")
+               colour_span=("colour","nunique"),        
+               colour_sku=("SKU_Count","sum"),
+               colour_qty=("Total_Qty_Q1","sum"),
+               colour_density=("Style_Density_Proxy","mean")
             ).reset_index()
             s_metrics = size_final.groupby(art_keys, dropna=False).agg(
                 size_span=("size_norm","nunique"),
