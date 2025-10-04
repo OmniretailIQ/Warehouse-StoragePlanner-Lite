@@ -956,10 +956,15 @@ if just_clicked_run:
             bulk_assign, bulk_diag = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
 
 
+
 # ---------- Controlled PF Overflow from Bulk ----------
-if 'allow_pf_overflow' in globals() and allow_pf_overflow and bins_df is not None and not bins_df.empty:
+# Use a safe handle for bins_df to avoid NameError if it doesn't exist at this point
+_bins_df_obj = locals().get("bins_df", globals().get("bins_df", None))
+if 'allow_pf_overflow' in globals() and allow_pf_overflow and _bins_df_obj is not None and hasattr(_bins_df_obj, "empty") and not _bins_df_obj.empty:
+    bins_df_ref = _bins_df_obj  # local alias
+
     # PF capacity & protection bands
-    pf_cap_total = int(bins_df.loc[bins_df["bin_type"]=="PF","capacity_units"].sum())
+    pf_cap_total = int(bins_df_ref.loc[bins_df_ref["bin_type"]=="PF","capacity_units"].sum())
     pf_core_cap   = int(pf_cap_total * (pf_core_reserve_pct/100.0))
     pf_overflow_cap = int(pf_cap_total * ((pf_core_reserve_pct + pf_overflow_max_pct)/100.0))
 
@@ -968,7 +973,7 @@ if 'allow_pf_overflow' in globals() and allow_pf_overflow and bins_df is not Non
     overflow_room_units = max(0, pf_overflow_cap - pf_core_assigned)
 
     # Remaining PF bin capacity map (after core PF)
-    pf_bins_left = pf_remaining_capacity_bins(bins_df, pf_assign if 'pf_assign' in locals() else None)
+    pf_bins_left = pf_remaining_capacity_bins(bins_df_ref, pf_assign if 'pf_assign' in locals() else None)
     total_pf_left_units = int(pf_bins_left["available"].sum()) if (pf_bins_left is not None and not pf_bins_left.empty) else 0
     overflow_room_units = min(overflow_room_units, total_pf_left_units)
 
@@ -1060,14 +1065,6 @@ if 'allow_pf_overflow' in globals() and allow_pf_overflow and bins_df is not Non
             except Exception:
                 pass
 
-
-    # Reason codes
-    drive_flags = drive_df.copy()
-    drive_flags["PF_Eligible"] = drive_flags["Zoning"].eq("PickFace+Bulk")
-    drive_flags["PF_Need"] = drive_flags["PF_Max_units"].fillna(0).astype(int)
-    drive_flags["Bulk_Need"] = drive_flags["Bulk_Final"].fillna(0).astype(int)
-    pf_flags = drive_flags[["Set_ID","PF_Eligible","PF_Need"]].drop_duplicates()
-    bk_flags = drive_flags[["Set_ID","Bulk_Need"]].drop_duplicates()
 
     def reason_pf(row):
         if not bool(row.get("PF_Eligible", False)):
