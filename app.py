@@ -742,12 +742,12 @@ if scale != 1.0:
 drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
 
     # -------- Governed Summary (store in session) --------
-    daily_demand_total = float(drive_df["D_day_uplift"].sum())
-    pf_need = int(drive_df["PF_Max_units"].sum())
-    bulk_need = int(drive_df["Bulk_Final"].sum())
-    total_need = pf_need + bulk_need
-    gov_cover_days = (total_need / daily_demand_total) if daily_demand_total > 0 else 0.0
-    st.session_state["gov_summary"] = {
+daily_demand_total = float(drive_df["D_day_uplift"].sum())
+pf_need = int(drive_df["PF_Max_units"].sum())
+bulk_need = int(drive_df["Bulk_Final"].sum())
+total_need = pf_need + bulk_need
+gov_cover_days = (total_need / daily_demand_total) if daily_demand_total > 0 else 0.0
+st.session_state["gov_summary"] = {
         "pf_cap": int(pf_cap) if pf_cap is not None else None,
         "pf_need": pf_need,
         "pf_cap_util": (pf_need / pf_cap) if pf_cap else None,
