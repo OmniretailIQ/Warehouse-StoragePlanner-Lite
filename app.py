@@ -718,10 +718,10 @@ if just_clicked_run:
     baseline_daily_uplift = compute_uplifted_daily_baseline(sales_df, rrs_map_df)
     sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
     scale = 1.0
-   if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
+    if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
     scale = baseline_daily_uplift / sum_drive_daily_uplift
 
-   if scale != 1.0:
+    if scale != 1.0:
     # Scale demand and all unit-based targets proportionally
      for col in ["D_day", "D_day_uplift",
                 "PF_Min_units_raw", "PF_Max_units_raw",
