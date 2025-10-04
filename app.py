@@ -708,75 +708,75 @@ if just_clicked_run:
             alloc_axis = st.sidebar.radio("Allocation axis (non-hybrid)", options=["ColourSets","SizeSets"], index=0)
             drive_df = colour_final.copy() if alloc_axis=="ColourSets" else size_final.copy()
 
-    # Compute optional PF capacity from Bin Master (for governor)
-    pf_cap = None
-    if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
-        pf_cap = int(bins_df.loc[bins_df["bin_type"]=="PF","capacity_units"].sum())
+        # Compute optional PF capacity from Bin Master (for governor)
+        pf_cap = None
+        if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
+            pf_cap = int(bins_df.loc[bins_df["bin_type"]=="PF","capacity_units"].sum())
 
-    # Apply governor on the driving union with PF cap awareness
-    # ---- Normalize demand so sum(D_day_uplift) matches the file baseline (prevents over-count) ----
-    baseline_daily_uplift = compute_uplifted_daily_baseline(sales_df, rrs_map_df)
-    sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
-    scale = 1.0
-    if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
-      scale = baseline_daily_uplift / sum_drive_daily_uplift
+        # Apply governor on the driving union with PF cap awareness
+        # ---- Normalize demand so sum(D_day_uplift) matches the file baseline (prevents over-count) ----
+        baseline_daily_uplift = compute_uplifted_daily_baseline(sales_df, rrs_map_df)
+        sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
+        scale = 1.0
+        if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
+            scale = baseline_daily_uplift / sum_drive_daily_uplift
 
-    if scale != 1.0:
-    # Scale demand and all unit-based targets proportionally
-     for col in ["D_day", "D_day_uplift",
-                "PF_Min_units_raw", "PF_Max_units_raw",
-                "PF_Min_units", "PF_Max_units",
-                "Bulk_Min_units", "Bulk_Max_units",
-                "Bulk_Final", "Final_Total"]:
-        if col in drive_df.columns:
-            drive_df[col] = (drive_df[col].astype(float) * scale)
+        if scale != 1.0:
+            # Scale demand and all unit-based targets proportionally
+            for col in ["D_day", "D_day_uplift",
+                        "PF_Min_units_raw", "PF_Max_units_raw",
+                        "PF_Min_units", "PF_Max_units",
+                        "Bulk_Min_units", "Bulk_Max_units",
+                        "Bulk_Final", "Final_Total"]:
+                if col in drive_df.columns:
+                    drive_df[col] = (drive_df[col].astype(float) * scale)
 
-    # Recompute cover days on scaled demand
-     drive_df["Final_DaysCover"] = np.where(
-        drive_df["D_day_uplift"]>0,
-        drive_df["Final_Total"]/drive_df["D_day_uplift"],
-        0.0
-    )
+        # Recompute cover days on scaled demand
+        drive_df["Final_DaysCover"] = np.where(
+            drive_df["D_day_uplift"]>0,
+            drive_df["Final_Total"]/drive_df["D_day_uplift"],
+            0.0
+        )
 
-# ---- Now apply the capacity governors (PF cap, then Total cap) ----
-drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
+        # ---- Now apply the capacity governors (PF cap, then Total cap) ----
+        drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
 
-    # -------- Governed Summary (store in session) --------
-daily_demand_total = float(drive_df["D_day_uplift"].sum())
-pf_need = int(drive_df["PF_Max_units"].sum())
-bulk_need = int(drive_df["Bulk_Final"].sum())
-total_need = pf_need + bulk_need
-gov_cover_days = (total_need / daily_demand_total) if daily_demand_total > 0 else 0.0
-st.session_state["gov_summary"] = {
-        "pf_cap": int(pf_cap) if pf_cap is not None else None,
-        "pf_need": pf_need,
-        "pf_cap_util": (pf_need / pf_cap) if pf_cap else None,
-        "total_cap": int(cap_total),
-        "total_need": int(total_need),
-        "bulk_need": int(bulk_need),
-        "daily_demand": daily_demand_total,
-        "cover_days": float(gov_cover_days),
-    }
+        # -------- Governed Summary (store in session) --------
+        daily_demand_total = float(drive_df["D_day_uplift"].sum())
+        pf_need = int(drive_df["PF_Max_units"].sum())
+        bulk_need = int(drive_df["Bulk_Final"].sum())
+        total_need = pf_need + bulk_need
+        gov_cover_days = (total_need / daily_demand_total) if daily_demand_total > 0 else 0.0
+        st.session_state["gov_summary"] = {
+            "pf_cap": int(pf_cap) if pf_cap is not None else None,
+            "pf_need": pf_need,
+            "pf_cap_util": (pf_need / pf_cap) if pf_cap else None,
+            "total_cap": int(cap_total),
+            "total_need": int(total_need),
+            "bulk_need": int(bulk_need),
+            "daily_demand": daily_demand_total,
+            "cover_days": float(gov_cover_days),
+        }
 
     # Racking assignment (only driving pool) + diagnostics
-pf_assign = pd.DataFrame()
-bulk_assign = pd.DataFrame()
-pf_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
-bulk_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
-if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
+    pf_assign = pd.DataFrame()
+    bulk_assign = pd.DataFrame()
+    pf_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
+    bulk_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
+    if bins_df is not None and isinstance(bins_df, pd.DataFrame) and not bins_df.empty:
         with st.spinner("Assigning sets to PF/Bulk bins..."):
             pf_assign, pf_diag = assign_bins(drive_df, bins_df, pf_or_bulk="PF")
             bulk_assign, bulk_diag = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
 
     # Reason codes (why bins may be blank)
-drive_flags = drive_df.copy()
-drive_flags["PF_Eligible"] = drive_flags["Zoning"].eq("PickFace+Bulk")
-drive_flags["PF_Need"] = drive_flags["PF_Max_units"].fillna(0).astype(int)
-drive_flags["Bulk_Need"] = drive_flags["Bulk_Final"].fillna(0).astype(int)
-pf_flags = drive_flags[["Set_ID","PF_Eligible","PF_Need"]].drop_duplicates()
-bk_flags = drive_flags[["Set_ID","Bulk_Need"]].drop_duplicates()
+    drive_flags = drive_df.copy()
+    drive_flags["PF_Eligible"] = drive_flags["Zoning"].eq("PickFace+Bulk")
+    drive_flags["PF_Need"] = drive_flags["PF_Max_units"].fillna(0).astype(int)
+    drive_flags["Bulk_Need"] = drive_flags["Bulk_Final"].fillna(0).astype(int)
+    pf_flags = drive_flags[["Set_ID","PF_Eligible","PF_Need"]].drop_duplicates()
+    bk_flags = drive_flags[["Set_ID","Bulk_Need"]].drop_duplicates()
 
-def reason_pf(row):
+    def reason_pf(row):
         if not bool(row.get("PF_Eligible", False)):
             return "Not PF-eligible (zoning)"
         if int(row.get("PF_Min_units",0))==0 and int(row.get("PF_Max_units",0))==0:
@@ -785,28 +785,28 @@ def reason_pf(row):
             return "No PF bins available / capacity exhausted"
         return ""
 
-def reason_bulk(row):
+    def reason_bulk(row):
         if int(row.get("Bulk_Min_units",0))==0 and int(row.get("Bulk_Final",0))==0:
             return "No Bulk need (or squeezed by capacity governor)"
         if int(row.get("Bulk_Assigned_Qty",0))==0:
             return "No Bulk bins available / capacity exhausted"
         return ""
 
-consolidated_df = build_consolidated(drive_df, pf_assign, bulk_assign)
-consolidated_df = consolidated_df.merge(pf_flags, on="Set_ID", how="left").merge(bk_flags, on="Set_ID", how="left")
-consolidated_df["PF_Reason"] = consolidated_df.apply(reason_pf, axis=1)
-consolidated_df["Bulk_Reason"] = consolidated_df.apply(reason_bulk, axis=1)
+    consolidated_df = build_consolidated(drive_df, pf_assign, bulk_assign)
+    consolidated_df = consolidated_df.merge(pf_flags, on="Set_ID", how="left").merge(bk_flags, on="Set_ID", how="left")
+    consolidated_df["PF_Reason"] = consolidated_df.apply(reason_pf, axis=1)
+    consolidated_df["Bulk_Reason"] = consolidated_df.apply(reason_bulk, axis=1)
 
     # Save to session
-st.session_state["colour_final"] = colour_final
-st.session_state["size_final"] = size_final
-st.session_state["pf_assign"] = pf_assign
-st.session_state["bulk_assign"] = bulk_assign
-st.session_state["drive_df"] = drive_df
-st.session_state["consolidated_df"] = consolidated_df
-st.session_state["pf_diag"] = pf_diag
-st.session_state["bulk_diag"] = bulk_diag
-st.session_state["results_ready"] = True
+    st.session_state["colour_final"] = colour_final
+    st.session_state["size_final"] = size_final
+    st.session_state["pf_assign"] = pf_assign
+    st.session_state["bulk_assign"] = bulk_assign
+    st.session_state["drive_df"] = drive_df
+    st.session_state["consolidated_df"] = consolidated_df
+    st.session_state["pf_diag"] = pf_diag
+    st.session_state["bulk_diag"] = bulk_diag
+    st.session_state["results_ready"] = True
 
 # -------------------- Display from session --------------------
 if st.session_state["results_ready"]:
@@ -981,7 +981,7 @@ if st.session_state["results_ready"]:
         "Download Planner Output (Excel, full)",
         data=xls_bytes,
         file_name="WarehousePlannerLite_Output.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheet.sheet",
         use_container_width=True
     )
 
@@ -990,12 +990,7 @@ if st.session_state["results_ready"]:
         for k in ["results_ready","colour_final","size_final","pf_assign","bulk_assign","drive_df",
                   "consolidated_df","pf_diag","bulk_diag","gov_summary"]:
             st.session_state[k] = None
-        st.experimental_rerun()
+        st.rerun()
 
 else:
     st.info("Upload files (and optional Bin Master) then click **Run Planner**.")
-
-
-
-
-
