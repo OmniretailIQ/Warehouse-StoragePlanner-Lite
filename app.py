@@ -29,6 +29,15 @@ allow_stranger_overflow = st.sidebar.checkbox(
 )
 overflow_dwell_days = st.sidebar.number_input(
     "Overflow dwell cap (days)", min_value=1, value=3, step=1,
+
+
+# ABC eligibility for PF overflow (configurable)
+pf_overflow_abc = st.sidebar.multiselect(
+    "PF overflow eligible ABC classes",
+    options=["A","B","C"],
+    default=["A","B"],
+    help="Only these ABC classes can overflow into PF."
+)
     help="Operational dwell limit for PF overflow inventory."
 )
 
@@ -1000,7 +1009,7 @@ if 'allow_pf_overflow' in globals() and allow_pf_overflow and _bins_df_obj is no
         elig = elig[elig["Bulk_Remain"] > 0]
         elig = elig[elig["Zoning"].isin(["Bulk","PickFace+Bulk"])]
         elig = elig[elig["Style_Density_Proxy"] <= overflow_density_max]
-        elig = elig[elig["ABC_Class_Rolled"].isin(["A","B"])]
+        elig = elig[elig["ABC_Class_Rolled"].isin(pf_overflow_abc)]
         if not allow_stranger_overflow:
             elig = elig[elig["RRS_Class_Rolled"] != "Stranger"]
 
@@ -1135,6 +1144,45 @@ if isinstance(_cons_df, pd.DataFrame) and not _cons_df.empty:
         st.metric("% of Bulk overflow absorbed", f"{overflow_absorb_pct:.1f}%")
 
 
+    # ---- PF overflow eligibility — diagnostics ----
+    try:
+        _drive_df = st.session_state.get("drive_df", globals().get("drive_df"))
+        _bulk_assign = st.session_state.get("bulk_assign", globals().get("bulk_assign"))
+        bulk_used_by_set = (_bulk_assign.groupby("Set_ID", as_index=False)["Assigned_Qty"]
+                            .sum().rename(columns={"Assigned_Qty":"Bulk_Assigned_Qty"})) if (_bulk_assign is not None and not _bulk_assign.empty) else pd.DataFrame(columns=["Set_ID","Bulk_Assigned_Qty"])
+        need_diag = (_drive_df[["Set_ID","ABC_Class_Rolled","RRS_Class_Rolled","Style_Density_Proxy","Zoning","Bulk_Final"]]
+                        .merge(bulk_used_by_set, on="Set_ID", how="left").fillna({"Bulk_Assigned_Qty":0}))
+        need_diag["Bulk_Remain"] = (need_diag["Bulk_Final"] - need_diag["Bulk_Assigned_Qty"]).clip(lower=0).astype(int)
+
+        pool = need_diag[(need_diag["Bulk_Remain"]>0) & (need_diag["Zoning"].isin(["Bulk","PickFace+Bulk"]))].copy()
+        pool_units = int(pool["Bulk_Remain"].sum())
+
+        rej_abc_units = int(pool.loc[~pool["ABC_Class_Rolled"].isin(pf_overflow_abc), "Bulk_Remain"].sum())
+        step = pool[pool["ABC_Class_Rolled"].isin(pf_overflow_abc)].copy()
+
+        rej_str_units = int(step.loc[(step["RRS_Class_Rolled"]=="Stranger") & (not allow_stranger_overflow), "Bulk_Remain"].sum())
+        if not allow_stranger_overflow:
+            step = step[step["RRS_Class_Rolled"]!="Stranger"]
+
+        rej_density_units = int(step.loc[step["Style_Density_Proxy"] > overflow_density_max, "Bulk_Remain"].sum())
+        step = step[step["Style_Density_Proxy"] <= overflow_density_max]
+
+        eligible_units_diag = int(step["Bulk_Remain"].sum())
+
+        with st.expander("PF overflow eligibility — diagnostics", expanded=False):
+            st.write({
+                "Bulk remainder pool (units)": pool_units,
+                "Rejected by ABC (units)": rej_abc_units,
+                "Rejected as Stranger (units)": rej_str_units,
+                "Rejected by density (units)": rej_density_units,
+                "Eligible pool (units)": eligible_units_diag,
+                "Absorbed into PF overflow (units)": int(pf_overflow_units),
+            })
+    except Exception:
+        pass
+
+
+
 
 
 # Reason codes & session save (guarded for first-load safety)
@@ -1217,6 +1265,45 @@ if isinstance(_cons_df, pd.DataFrame) and not _cons_df.empty:
         st.metric("PF overflow absorbed (pcs)", f"{pf_overflow_units:,}")
     with c6:
         st.metric("% of Bulk overflow absorbed", f"{overflow_absorb_pct:.1f}%")
+
+
+    # ---- PF overflow eligibility — diagnostics ----
+    try:
+        _drive_df = st.session_state.get("drive_df", globals().get("drive_df"))
+        _bulk_assign = st.session_state.get("bulk_assign", globals().get("bulk_assign"))
+        bulk_used_by_set = (_bulk_assign.groupby("Set_ID", as_index=False)["Assigned_Qty"]
+                            .sum().rename(columns={"Assigned_Qty":"Bulk_Assigned_Qty"})) if (_bulk_assign is not None and not _bulk_assign.empty) else pd.DataFrame(columns=["Set_ID","Bulk_Assigned_Qty"])
+        need_diag = (_drive_df[["Set_ID","ABC_Class_Rolled","RRS_Class_Rolled","Style_Density_Proxy","Zoning","Bulk_Final"]]
+                        .merge(bulk_used_by_set, on="Set_ID", how="left").fillna({"Bulk_Assigned_Qty":0}))
+        need_diag["Bulk_Remain"] = (need_diag["Bulk_Final"] - need_diag["Bulk_Assigned_Qty"]).clip(lower=0).astype(int)
+
+        pool = need_diag[(need_diag["Bulk_Remain"]>0) & (need_diag["Zoning"].isin(["Bulk","PickFace+Bulk"]))].copy()
+        pool_units = int(pool["Bulk_Remain"].sum())
+
+        rej_abc_units = int(pool.loc[~pool["ABC_Class_Rolled"].isin(pf_overflow_abc), "Bulk_Remain"].sum())
+        step = pool[pool["ABC_Class_Rolled"].isin(pf_overflow_abc)].copy()
+
+        rej_str_units = int(step.loc[(step["RRS_Class_Rolled"]=="Stranger") & (not allow_stranger_overflow), "Bulk_Remain"].sum())
+        if not allow_stranger_overflow:
+            step = step[step["RRS_Class_Rolled"]!="Stranger"]
+
+        rej_density_units = int(step.loc[step["Style_Density_Proxy"] > overflow_density_max, "Bulk_Remain"].sum())
+        step = step[step["Style_Density_Proxy"] <= overflow_density_max]
+
+        eligible_units_diag = int(step["Bulk_Remain"].sum())
+
+        with st.expander("PF overflow eligibility — diagnostics", expanded=False):
+            st.write({
+                "Bulk remainder pool (units)": pool_units,
+                "Rejected by ABC (units)": rej_abc_units,
+                "Rejected as Stranger (units)": rej_str_units,
+                "Rejected by density (units)": rej_density_units,
+                "Eligible pool (units)": eligible_units_diag,
+                "Absorbed into PF overflow (units)": int(pf_overflow_units),
+            })
+    except Exception:
+        pass
+
 
 
 
