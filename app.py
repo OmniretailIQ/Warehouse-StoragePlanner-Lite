@@ -6,7 +6,8 @@ from io import BytesIO
 st.set_page_config(page_title="Warehouse Planner Lite (Sets)", layout="wide")
 
 # -------------------- Session State Boot --------------------
-for k in ["results_ready", "colour_final", "size_final", "pf_assign", "bulk_assign", "drive_df", "consolidated_df"]:
+for k in ["results_ready", "colour_final", "size_final", "pf_assign", "bulk_assign",
+          "drive_df", "consolidated_df", "pf_diag", "bulk_diag"]:
     if k not in st.session_state:
         st.session_state[k] = None
 
@@ -56,7 +57,7 @@ for key, (dmin, dmax) in def_val.items():
 # Hybrid allocation toggle + optional overrides
 hybrid_mode = st.sidebar.checkbox("Hybrid allocation (auto choose Colour vs Size per article)", value=True)
 st.sidebar.caption("Hybrid mode avoids double counting by selecting one axis per article/family.")
-override_file = st.sidebar.file_uploader("Optional: Axis Overrides CSV (columns: division,department,brand,article,force_axis)", type=["csv"])
+override_file = st.sidebar.file_uploader("Optional: Axis Overrides CSV (division,department,brand,article,force_axis)", type=["csv"])
 
 # -------------------- Page header --------------------
 st.title("Warehouse Planner Lite — Set-level (Colour/Size)")
@@ -203,7 +204,7 @@ def compute_minmax(set_df, set_type, festival_map, pf_policy_map, cov_min_days, 
     df["Bulk_Min_units"] = (df["D_day_uplift"] * (0.6*df["BulkTarget_days"])).round().astype(int)
     df["Bulk_Max_units"] = (df["D_day_uplift"] * (1.0*df["BulkTarget_days"])).round().astype(int)
 
-    # Default "finals" (governor may adjust later on driving pool)
+    # Default finals; governor will apply on the driving pool
     def tier(a, r):
         if a=="A" and r=="Runner": return 1
         if a=="A" and r=="Repeater": return 2
@@ -238,17 +239,14 @@ def choose_axis_for_article(row, size_span, colour_span, size_density, colour_de
         return "SizeSet"
     if dept in COLOUR_DEPT_HINTS: 
         return "ColourSet"
-    # data-driven
     if (size_span >= 4) and (colour_span <= 3):
         return "SizeSet"
     if (colour_span >= 4) and (size_span <= 3):
         return "ColourSet"
-    # lower density = more coherent
     if size_density < colour_density:
         return "SizeSet"
     if colour_density < size_density:
         return "ColourSet"
-    # PF-friendliness tie-break
     if (size_density <= pf_thr) and (colour_density > pf_thr):
         return "SizeSet"
     if (colour_density <= pf_thr) and (size_density > pf_thr):
@@ -295,11 +293,20 @@ def build_bin_master(df):
         "capacity_units": capacity_units,
     })
 
-    bins["sort_key"] = bins["zone"].astype(str)+"|"+bins["row"].astype(str)+"|"+bins["bay"].astype(str)+"|"+bins["level"].astype(str)+"|"+bins["bin_code"].astype(str)
+    # Cleanup: drop unusable rows and enforce numeric
+    bins = bins.dropna(subset=["level", "bin_code"])
+    bins = bins[bins["bin_code"].astype(str).str.strip() != ""]
+    bins["row"] = pd.to_numeric(bins["row"], errors="coerce")
+    bins["bay"] = pd.to_numeric(bins["bay"], errors="coerce")
+    bins["level"] = pd.to_numeric(bins["level"], errors="coerce")
+    bins = bins.dropna(subset=["row","bay","level"]).reset_index(drop=True)
+
+    bins["sort_key"] = (bins["zone"].astype(str)+"|"+bins["row"].astype(str)+"|"+
+                        bins["bay"].astype(str)+"|"+bins["level"].astype(str)+"|"+bins["bin_code"].astype(str))
     return bins
 
 def assign_bins(sets_df, bins_df, pf_or_bulk="PF"):
-    """Greedy assignment of sets to PF or BULK bins by priority and capacity."""
+    """Greedy assignment of sets to PF or BULK bins by priority and capacity. Returns (assign_df, diagnostics)."""
     df = sets_df.copy()
     if pf_or_bulk == "PF":
         cand = df[df["Zoning"]=="PickFace+Bulk"].copy()
@@ -360,7 +367,14 @@ def assign_bins(sets_df, bins_df, pf_or_bulk="PF"):
         if bin_idx >= len(bins_avail):
             break
 
-    return pd.DataFrame(assigns)
+    assigned_units = int(pd.DataFrame(assigns)["Assigned_Qty"].sum()) if assigns else 0
+    diag = {
+        "bins_available": int(len(bins_avail)),
+        "bins_used": int((bins_avail["available"] < bins_avail["capacity_units"]).sum()),
+        "total_need_units": int(cand["Need"].sum()),
+        "assigned_units": assigned_units
+    }
+    return pd.DataFrame(assigns), diag
 
 def apply_capacity_governor(drive_df, cap_total_pcs):
     df = drive_df.copy()
@@ -508,14 +522,14 @@ if just_clicked_run:
                                       "SizeSet", festival_map, pf_policy_map, cov_min, cov_max, cap_total)
 
         # Hybrid allocation decision (per article)
-        drive_df = None
+        art_keys = ["division","department","brand","article"]
         if hybrid_mode:
-            art_keys = ["division","department","brand","article"]
+            # metrics on lowercase source columns
             c_metrics = colour_final.groupby(art_keys, dropna=False).agg(
-               colour_span=("colour","nunique"),        
-               colour_sku=("SKU_Count","sum"),
-               colour_qty=("Total_Qty_Q1","sum"),
-               colour_density=("Style_Density_Proxy","mean")
+                colour_span=("colour","nunique"),
+                colour_sku=("SKU_Count","sum"),
+                colour_qty=("Total_Qty_Q1","sum"),
+                colour_density=("Style_Density_Proxy","mean")
             ).reset_index()
             s_metrics = size_final.groupby(art_keys, dropna=False).agg(
                 size_span=("size_norm","nunique"),
@@ -548,10 +562,9 @@ if just_clicked_run:
                     )
             axis_df["chosen_axis"] = decisions
 
-            # Attach chosen axis & filter
+            # Attach chosen axis & filter to non-overlapping driving union
             colour_with_axis = colour_final.merge(axis_df[art_keys+["chosen_axis"]], on=art_keys, how="left")
             size_with_axis   = size_final.merge(axis_df[art_keys+["chosen_axis"]], on=art_keys, how="left")
-
             drive_colour = colour_with_axis[colour_with_axis["chosen_axis"].eq("ColourSet")].copy()
             drive_size   = size_with_axis[size_with_axis["chosen_axis"].eq("SizeSet")].copy()
             drive_df = pd.concat([drive_colour, drive_size], ignore_index=True)
@@ -559,23 +572,50 @@ if just_clicked_run:
             # Apply capacity governor on driving union
             drive_df = apply_capacity_governor(drive_df, cap_total)
         else:
-            # Non-hybrid simple mode: choose one axis in sidebar (default ColourSets)
             alloc_axis = st.sidebar.radio("Allocation axis (non-hybrid)", options=["ColourSets","SizeSets"], index=0)
             if alloc_axis == "ColourSets":
                 drive_df = apply_capacity_governor(colour_final.copy(), cap_total)
             else:
                 drive_df = apply_capacity_governor(size_final.copy(), cap_total)
 
-    # Racking assignment (only driving pool)
+    # Racking assignment (only driving pool) + diagnostics
     pf_assign = pd.DataFrame()
     bulk_assign = pd.DataFrame()
+    pf_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
+    bulk_diag = {"bins_available":0,"bins_used":0,"total_need_units":0,"assigned_units":0}
     if bins_df is not None:
         with st.spinner("Assigning sets to PF/Bulk bins..."):
-            pf_assign = assign_bins(drive_df, bins_df, pf_or_bulk="PF")
-            bulk_assign = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
+            pf_assign, pf_diag = assign_bins(drive_df, bins_df, pf_or_bulk="PF")
+            bulk_assign, bulk_diag = assign_bins(drive_df, bins_df, pf_or_bulk="BULK")
 
-    # Consolidated table
+    # Reason codes (why bins may be blank)
+    drive_flags = drive_df.copy()
+    drive_flags["PF_Eligible"] = drive_flags["Zoning"].eq("PickFace+Bulk")
+    drive_flags["PF_Need"] = drive_flags["PF_Max_units"].fillna(0).astype(int)
+    drive_flags["Bulk_Need"] = drive_flags["Bulk_Final"].fillna(0).astype(int)
+    pf_flags = drive_flags[["Set_ID","PF_Eligible","PF_Need"]].drop_duplicates()
+    bk_flags = drive_flags[["Set_ID","Bulk_Need"]].drop_duplicates()
+
+    def reason_pf(row):
+        if not bool(row.get("PF_Eligible", False)):
+            return "Not PF-eligible (zoning)"
+        if int(row.get("PF_Min_units",0))==0 and int(row.get("PF_Max_units",0))==0:
+            return "No PF need"
+        if int(row.get("PF_Assigned_Qty",0))==0:
+            return "No PF bins available / capacity exhausted"
+        return ""
+
+    def reason_bulk(row):
+        if int(row.get("Bulk_Min_units",0))==0 and int(row.get("Bulk_Final",0))==0:
+            return "No Bulk need (or squeezed by capacity governor)"
+        if int(row.get("Bulk_Assigned_Qty",0))==0:
+            return "No Bulk bins available / capacity exhausted"
+        return ""
+
     consolidated_df = build_consolidated(drive_df, pf_assign, bulk_assign)
+    consolidated_df = consolidated_df.merge(pf_flags, on="Set_ID", how="left").merge(bk_flags, on="Set_ID", how="left")
+    consolidated_df["PF_Reason"] = consolidated_df.apply(reason_pf, axis=1)
+    consolidated_df["Bulk_Reason"] = consolidated_df.apply(reason_bulk, axis=1)
 
     # Save to session
     st.session_state["colour_final"] = colour_final
@@ -584,6 +624,8 @@ if just_clicked_run:
     st.session_state["bulk_assign"] = bulk_assign
     st.session_state["drive_df"] = drive_df
     st.session_state["consolidated_df"] = consolidated_df
+    st.session_state["pf_diag"] = pf_diag
+    st.session_state["bulk_diag"] = bulk_diag
     st.session_state["results_ready"] = True
 
 # -------------------- Display from session --------------------
@@ -594,9 +636,11 @@ if st.session_state["results_ready"]:
     bulk_assign = st.session_state["bulk_assign"]
     drive_df = st.session_state["drive_df"]
     consolidated_df = st.session_state["consolidated_df"]
+    pf_diag = st.session_state["pf_diag"] or {}
+    bulk_diag = st.session_state["bulk_diag"] or {}
 
     st.success("Planner run complete. Explore below and download outputs.")
-    st.caption("Hybrid allocation (if enabled) selects Colour or Size per article; racking & capacity uses the chosen axis only.")
+    st.caption("Hybrid allocation (if enabled) selects Colour or Size per article; racking & capacity use the chosen axis only.")
 
     # ColourSets
     st.subheader("Colour Sets — Zoning & Min–Max (preview)")
@@ -621,6 +665,28 @@ if st.session_state["results_ready"]:
         mime="text/csv",
         use_container_width=True
     )
+
+    # Bin Utilization Summary
+    st.subheader("Bin Utilization Summary")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("**Pick-Face (PF) bins**")
+        st.write({
+            "PF bins available": pf_diag.get("bins_available", 0),
+            "PF bins used (≥1 unit)": pf_diag.get("bins_used", 0),
+            "PF total need (units)": pf_diag.get("total_need_units", 0),
+            "PF assigned (units)": pf_diag.get("assigned_units", 0),
+            "PF unassigned (units)": max(pf_diag.get("total_need_units", 0) - pf_diag.get("assigned_units", 0), 0)
+        })
+    with col2:
+        st.markdown("**Bulk bins**")
+        st.write({
+            "Bulk bins available": bulk_diag.get("bins_available", 0),
+            "Bulk bins used (≥1 unit)": bulk_diag.get("bins_used", 0),
+            "Bulk total need (units)": bulk_diag.get("total_need_units", 0),
+            "Bulk assigned (units)": bulk_diag.get("assigned_units", 0),
+            "Bulk unassigned (units)": max(bulk_diag.get("total_need_units", 0) - bulk_diag.get("assigned_units", 0), 0)
+        })
 
     # Racking assignment previews
     if pf_assign is not None and not pf_assign.empty:
@@ -666,7 +732,8 @@ if st.session_state["results_ready"]:
                 "Warehouse Planner Lite Output",
                 "Tabs: ColourSets, SizeSets, PF_Assignments, Bulk_Assignments, Consolidated.",
                 "Zone=floor; Tier=F00->1; PF levels <= user setting (default 1–3); capacity per slot configurable.",
-                "Hybrid mode selects Colour or Size per article; only the chosen axis feeds capacity & racking."
+                "Hybrid mode selects Colour or Size per article; only the chosen axis feeds capacity & racking.",
+                "Reason codes indicate why PF/Bulk bins may be blank in Consolidated."
             ]}).to_excel(writer, sheet_name="README", index=False)
             col_df.to_excel(writer, sheet_name="ColourSets", index=False)
             size_df.to_excel(writer, sheet_name="SizeSets", index=False)
@@ -689,12 +756,13 @@ if st.session_state["results_ready"]:
 
     # Optional: Reset
     if st.button("Clear Results"):
-        for k in ["results_ready","colour_final","size_final","pf_assign","bulk_assign","drive_df","consolidated_df"]:
+        for k in ["results_ready","colour_final","size_final","pf_assign","bulk_assign","drive_df","consolidated_df","pf_diag","bulk_diag"]:
             st.session_state[k] = None
         st.experimental_rerun()
 
 else:
     st.info("Upload files (and optional Bin Master) then click **Run Planner**.")
+
 
 
 
