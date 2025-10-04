@@ -1116,29 +1116,24 @@ if isinstance(_cons_df, pd.DataFrame) and not _cons_df.empty:
     st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
 
 
-# ---- PF overflow absorption metrics ----
-_pf_assign = st.session_state.get("pf_assign", globals().get("pf_assign"))
-_bulk_diag = st.session_state.get("bulk_diag", globals().get("bulk_diag", {})) or {}
-try:
-    pf_overflow_units = int(_pf_assign.loc[_pf_assign["Bin_Type"]=="PF_OVERFLOW","Assigned_Qty"].sum()) if (_pf_assign is not None and not _pf_assign.empty) else 0
-except Exception:
-    pf_overflow_units = 0
+    # ---- PF overflow absorption metrics ----
+    _pf_assign = st.session_state.get("pf_assign", globals().get("pf_assign"))
+    try:
+        pf_overflow_units = int(_pf_assign.loc[_pf_assign["Bin_Type"]=="PF_OVERFLOW","Assigned_Qty"].sum()) if (_pf_assign is not None and not _pf_assign.empty) else 0
+    except Exception:
+        pf_overflow_units = 0
 
-try:
     bulk_need_total = int(_cons_df["Bulk_Final"].sum())
     bulk_assigned_total = int(_cons_df["Bulk_Assigned_Qty"].sum())
     bulk_unassigned_units = max(bulk_need_total - bulk_assigned_total, 0)
-except Exception:
-    bulk_unassigned_units = max(int(_bulk_diag.get("total_need_units", 0)) - int(_bulk_diag.get("assigned_units", 0)), 0)
+    overflow_absorb_pct = (100.0 * pf_overflow_units / bulk_unassigned_units) if bulk_unassigned_units > 0 else 0.0
 
-overflow_absorb_pct = (100.0 * pf_overflow_units / bulk_unassigned_units) if bulk_unassigned_units > 0 else 0.0
+    c5, c6 = st.columns(2)
+    with c5:
+        st.metric("PF overflow absorbed (pcs)", f"{pf_overflow_units:,}")
+    with c6:
+        st.metric("% of Bulk overflow absorbed", f"{overflow_absorb_pct:.1f}%")
 
-c5, c6 = st.columns(2)
-with c5:
-    st.metric("PF overflow absorbed (pcs)", f"{pf_overflow_units:,}")
-with c6:
-    st.metric("% of Bulk overflow absorbed", f"{overflow_absorb_pct:.1f}%")
-)
 
 
 
@@ -1205,29 +1200,24 @@ if isinstance(_cons_df, pd.DataFrame) and not _cons_df.empty:
     st.caption("Cross-Dock = remainder that cannot be stored in PF or Bulk after the governed plan and bin assignment.")
 
 
-# ---- PF overflow absorption metrics ----
-_pf_assign = st.session_state.get("pf_assign", globals().get("pf_assign"))
-_bulk_diag = st.session_state.get("bulk_diag", globals().get("bulk_diag", {})) or {}
-try:
-    pf_overflow_units = int(_pf_assign.loc[_pf_assign["Bin_Type"]=="PF_OVERFLOW","Assigned_Qty"].sum()) if (_pf_assign is not None and not _pf_assign.empty) else 0
-except Exception:
-    pf_overflow_units = 0
+    # ---- PF overflow absorption metrics ----
+    _pf_assign = st.session_state.get("pf_assign", globals().get("pf_assign"))
+    try:
+        pf_overflow_units = int(_pf_assign.loc[_pf_assign["Bin_Type"]=="PF_OVERFLOW","Assigned_Qty"].sum()) if (_pf_assign is not None and not _pf_assign.empty) else 0
+    except Exception:
+        pf_overflow_units = 0
 
-try:
     bulk_need_total = int(_cons_df["Bulk_Final"].sum())
     bulk_assigned_total = int(_cons_df["Bulk_Assigned_Qty"].sum())
     bulk_unassigned_units = max(bulk_need_total - bulk_assigned_total, 0)
-except Exception:
-    bulk_unassigned_units = max(int(_bulk_diag.get("total_need_units", 0)) - int(_bulk_diag.get("assigned_units", 0)), 0)
+    overflow_absorb_pct = (100.0 * pf_overflow_units / bulk_unassigned_units) if bulk_unassigned_units > 0 else 0.0
 
-overflow_absorb_pct = (100.0 * pf_overflow_units / bulk_unassigned_units) if bulk_unassigned_units > 0 else 0.0
+    c5, c6 = st.columns(2)
+    with c5:
+        st.metric("PF overflow absorbed (pcs)", f"{pf_overflow_units:,}")
+    with c6:
+        st.metric("% of Bulk overflow absorbed", f"{overflow_absorb_pct:.1f}%")
 
-c5, c6 = st.columns(2)
-with c5:
-    st.metric("PF overflow absorbed (pcs)", f"{pf_overflow_units:,}")
-with c6:
-    st.metric("% of Bulk overflow absorbed", f"{overflow_absorb_pct:.1f}%")
-)
 
 
 
@@ -1401,4 +1391,5 @@ with c6:
         st.experimental_rerun()
 else:
     st.info("Upload files (and optional Bin Master) then click **Run Planner**.")
+
 
