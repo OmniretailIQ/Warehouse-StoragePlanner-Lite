@@ -570,6 +570,31 @@ def build_kanban_triggers(drive_df, pf_assign_df, bulk_assign_df):
     ]
     return out[cols].sort_values(["Area","Tier","department","brand","article","Set_Label"]).reset_index(drop=True)
 
+def compute_uplifted_daily_baseline(sales_df, rrs_map_df):
+    """Compute baseline uplifted daily demand directly from the raw sales file (prevents overcount)."""
+    s = sales_df.copy()
+    qty = pd.to_numeric(s.get("total_qty", 0), errors="coerce").fillna(0.0)
+
+    # roll to unique SKU
+    if "invarticle_code" not in s.columns:
+        # if the column name differs in your file, this prevents a crash
+        s.columns = [str(c) for c in s.columns]
+    sku = s[["invarticle_code"]].copy()
+    sku["total_qty"] = qty
+    sku = sku.groupby("invarticle_code", as_index=False)["total_qty"].sum()
+
+    # join RRS to get per-SKU uplift (Unknown -> 1.0)
+    rrs = (rrs_map_df.drop_duplicates(subset=["invarticle_code"]).copy()
+           if rrs_map_df is not None and not rrs_map_df.empty else
+           pd.DataFrame(columns=["invarticle_code","RRS_Class"]))
+    uplift_map = {"Runner": festival_runner_repeater, "Repeater": festival_runner_repeater, "Stranger": festival_stranger}
+    sku = sku.merge(rrs, on="invarticle_code", how="left")
+    sku["uplift"] = sku["RRS_Class"].map(uplift_map).fillna(1.0)
+
+    # Q1 ≈ 91 days; baseline *with* uplift
+    daily = (sku["total_qty"] / 91.0) * sku["uplift"]
+    return float(daily.sum())
+
 # -------------------- Run / Display (Session-State) --------------------
 if just_clicked_run:
     sales_df = read_sales(sales_file)
@@ -689,7 +714,32 @@ if just_clicked_run:
         pf_cap = int(bins_df.loc[bins_df["bin_type"]=="PF","capacity_units"].sum())
 
     # Apply governor on the driving union with PF cap awareness
-    drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
+    # ---- Normalize demand so sum(D_day_uplift) matches the file baseline (prevents over-count) ----
+baseline_daily_uplift = compute_uplifted_daily_baseline(sales_df, rrs_map_df)
+sum_drive_daily_uplift = float(drive_df["D_day_uplift"].sum())
+scale = 1.0
+if sum_drive_daily_uplift > 0 and baseline_daily_uplift > 0:
+    scale = baseline_daily_uplift / sum_drive_daily_uplift
+
+if scale != 1.0:
+    # Scale demand and all unit-based targets proportionally
+    for col in ["D_day", "D_day_uplift",
+                "PF_Min_units_raw", "PF_Max_units_raw",
+                "PF_Min_units", "PF_Max_units",
+                "Bulk_Min_units", "Bulk_Max_units",
+                "Bulk_Final", "Final_Total"]:
+        if col in drive_df.columns:
+            drive_df[col] = (drive_df[col].astype(float) * scale)
+
+    # Recompute cover days on scaled demand
+    drive_df["Final_DaysCover"] = np.where(
+        drive_df["D_day_uplift"]>0,
+        drive_df["Final_Total"]/drive_df["D_day_uplift"],
+        0.0
+    )
+
+# ---- Now apply the capacity governors (PF cap, then Total cap) ----
+drive_df = apply_capacity_governor(drive_df, cap_total, pf_cap_pcs=pf_cap)
 
     # -------- Governed Summary (store in session) --------
     daily_demand_total = float(drive_df["D_day_uplift"].sum())
